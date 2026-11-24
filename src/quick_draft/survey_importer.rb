@@ -3,6 +3,9 @@ require 'json'
 
 module QuickDraft
   module SurveyImporter
+    TAG_SITE_ALL         = 'Site-All'.freeze
+    MASTER_GROUP_NAME    = 'Site_All'.freeze
+
     SURVEY_GROUP_NAME    = 'Site_Survey_2D'.freeze
     TERRAIN_GROUP_NAME   = 'Site_Terrain'.freeze
     LOT_LINES_GROUP_NAME = 'Site_Lot_Lines'.freeze
@@ -283,14 +286,15 @@ module QuickDraft
       @terrain_triangles = nil
       @terrain_points = nil
       @terrain_vertex_cache = {}
-      target_names = [SURVEY_GROUP_NAME, TERRAIN_GROUP_NAME, LOT_LINES_GROUP_NAME, TREES_GROUP_NAME, 'Site_Survey_Text', PAVING_GROUP_NAME, BUILDING_GROUP_NAME, RAW_LOT_GROUP_NAME]
+      target_names = [MASTER_GROUP_NAME, 'Site_All', 'Site-All', 'Terrain', SURVEY_GROUP_NAME, TERRAIN_GROUP_NAME, LOT_LINES_GROUP_NAME, TREES_GROUP_NAME, 'Site_Survey_Text', PAVING_GROUP_NAME, BUILDING_GROUP_NAME, RAW_LOT_GROUP_NAME]
       to_erase = []
-      model.entities.each do |ent|
+      (model.entities.to_a + model.active_entities.to_a).uniq.each do |ent|
+        next unless ent.valid?
         if (ent.is_a?(Sketchup::Group) || ent.is_a?(Sketchup::ComponentInstance)) && target_names.include?(ent.name)
           to_erase << ent
         end
       end
-      model.entities.erase_entities(to_erase) unless to_erase.empty?
+      to_erase.each { |e| e.erase! if e.valid? rescue nil }
     end
 
     def self.convert_dwg_to_dxf(dwg_path)
@@ -337,7 +341,7 @@ module QuickDraft
     end
 
     def self.import_cad_text(model, survey_group, path, norm_data = nil)
-      return 0 unless path && survey_group && survey_group.valid?
+      return [nil, 0] unless path && survey_group && survey_group.valid?
 
       clean_path = path.to_s.tr('\\', '/')
       dxf_path = nil
@@ -481,7 +485,7 @@ module QuickDraft
 
       if text_items.empty?
         puts 'QuickDraft: No TEXT/MTEXT entities found in DXF.'
-        return 0
+        return [nil, 0]
       end
 
       # Determine scale factor: if DXF coordinates span meters (~500m), scale by 39.37007874
@@ -593,7 +597,7 @@ module QuickDraft
       end
 
       puts "QuickDraft: Successfully imported #{text_count} CAD survey text annotations on '#{TAG_SURVEY_2D}'"
-      text_count
+      [text_group, text_count]
     end
 
     def self.analyze_survey_entities(survey_group)
@@ -888,9 +892,16 @@ module QuickDraft
           norm_data = normalize_site_origin(model, survey_group, path, geodetic_datum_m, property_layers)
           pipeline_res = process_survey_pipeline(model, survey_group, contour_layers, property_layers, tree_layers, paved_layers, path, norm_data, building_layers)
           terrain_group = pipeline_res.is_a?(Hash) ? pipeline_res[:terrain_group] : nil
+          raw_lot_group = pipeline_res.is_a?(Hash) ? pipeline_res[:raw_lot_group] : nil
+          trees_group   = pipeline_res.is_a?(Hash) ? pipeline_res[:trees_group] : nil
+          text_group    = pipeline_res.is_a?(Hash) ? pipeline_res[:text_group] : nil
+
+          # Combine all generated site groups into one master container group and tag ('Site-All')
+          site_groups = [survey_group, terrain_group, raw_lot_group, trees_group, text_group].compact.select(&:valid?)
+          master_group = combine_into_site_all(model, site_groups)
 
           # Ensure all automated 3D site tags are active and visible in the model
-          [TAG_TERRAIN, TAG_PROPERTY_LINE, TAG_TREES, TAG_SURVEY_2D, TAG_SURVEY_TEXT, TAG_DRIVEWAY, TAG_BUILDING_FOOTPRINT].each do |tag_name|
+          [TAG_SITE_ALL, 'Terrain', TAG_TERRAIN, TAG_PROPERTY_LINE, TAG_TREES, TAG_SURVEY_2D, TAG_SURVEY_TEXT, TAG_DRIVEWAY, TAG_BUILDING_FOOTPRINT, TAG_DESIGN_2D].each do |tag_name|
             tag = model.layers[tag_name]
             tag.visible = true if tag && tag.respond_to?(:visible=)
           end
@@ -909,14 +920,15 @@ module QuickDraft
                           "⚠ 3D TIN Terrain could not be generated from: #{contour_layers.join(', ')}"
                         end
 
-          raw_lot_msg = if result[:raw_lot_group] && result[:raw_lot_group].valid?
-                          e_count = result[:raw_lot_group].entities.grep(Sketchup::Edge).size
+          raw_lot_msg = if raw_lot_group && raw_lot_group.valid?
+                          e_count = raw_lot_group.entities.grep(Sketchup::Edge).size
                           "✓ Clean 2D Raw Lot Linework (#{e_count} lines) active on: '#{TAG_DESIGN_2D}'"
                         else
                           "✓ Clean 2D Raw Lot Linework active on: '#{TAG_DESIGN_2D}'"
                         end
 
           UI.messagebox("QuickDraft Automated Site Pipeline Complete!\n\n" \
+                        "✓ Combined Site Model active on master tag: '#{TAG_SITE_ALL}' (or 'Terrain')\n" \
                         "#{terrain_msg}\n" \
                         "✓ Stamped Driveway Asphalt active on tag: '#{TAG_DRIVEWAY}'\n" \
                         "✓ Stamped Building Footprint active on tag: '#{TAG_BUILDING_FOOTPRINT}'\n" \
@@ -926,7 +938,7 @@ module QuickDraft
                         "✓ 2D CAD Survey Text active on tag: '#{TAG_SURVEY_TEXT}'\n" \
                         "✓ Existing trees mapped from: #{tree_layers.join(', ')}\n" \
                         "✓ Geodetic sea-level benchmark: #{geodetic_datum_m} m\n\n" \
-                        "All 3D site features unified into a single 'Site_Terrain' object.")
+                        "All site elements combined into '#{MASTER_GROUP_NAME}' on tag '#{TAG_SITE_ALL}'.")
         rescue StandardError => e
           model.abort_operation
           UI.messagebox("Error processing survey layers:\n\n#{e.message}\n\n#{e.backtrace.first(3).join("\n")}")
@@ -1152,7 +1164,7 @@ module QuickDraft
     # =========================================================================
     # Site Normalization & Real-World Geodetic Datum Storage
     # =========================================================================
-    def self.normalize_site_origin(model, survey_group, path, geodetic_datum_m, property_layers = [])
+    def self.normalize_site_origin(model, survey_group, path, geodetic_datum_m, property_layers = [], protected_layers = [])
       prop_box = get_property_bounds(survey_group, property_layers)
       target_box = (prop_box && !prop_box.empty?) ? prop_box : survey_group.bounds
 
@@ -1186,15 +1198,16 @@ module QuickDraft
       translation = Geom::Transformation.translation(Geom::Vector3d.new(-center_x, -center_y, 0))
       survey_group.transform!(translation)
 
-      # Cull distant off-site surveyor regional traverse tie lines, monuments, and shots (> 100 ft beyond property)
+      # Cull distant off-site surveyor regional traverse tie lines, monuments, and shots
       # so the bounding box of Site_Survey_2D tightly frames the actual drawing sheet.
+      # NEVER cull lines on protected property or design layers.
       half_w = target_box.width * 0.5
       half_h = target_box.height * 0.5
-      sheet_min_x = -half_w - 1200.0
-      sheet_max_x =  half_w + 1200.0
-      sheet_min_y = -half_h - 1500.0
-      sheet_max_y =  half_h + 1200.0
-      cull_offsite_survey_entities(survey_group, sheet_min_x, sheet_max_x, sheet_min_y, sheet_max_y)
+      sheet_min_x = -[half_w + 1500.0, 3000.0].max
+      sheet_max_x =  [half_w + 1500.0, 3000.0].max
+      sheet_min_y = -[half_h + 2000.0, 4000.0].max
+      sheet_max_y =  [half_h + 1500.0, 3500.0].max
+      cull_offsite_survey_entities(survey_group, sheet_min_x, sheet_max_x, sheet_min_y, sheet_max_y, property_layers)
 
       dict = model.attribute_dictionary(DICT_SITE_DATA, true)
       dict['easting_offset']    = center_x.to_f
@@ -1219,7 +1232,7 @@ module QuickDraft
       }
     end
 
-    def self.cull_offsite_survey_entities(survey_group, min_x, max_x, min_y, max_y)
+    def self.cull_offsite_survey_entities(survey_group, min_x, max_x, min_y, max_y, property_layers = [])
       return unless survey_group && survey_group.valid?
 
       # Explode any nested ComponentInstances so all entities become accessible
@@ -1235,15 +1248,27 @@ module QuickDraft
       tr = survey_group.transformation
       to_erase = []
 
-      check_entities = lambda do |entities, current_tr|
+      is_property_layer = lambda do |layer_name|
+        return false if layer_name.nil? || layer_name.empty?
+        return true if property_layers && property_layers.include?(layer_name)
+        return true if layer_name =~ /oip|nbound|bound.*line/i
+        false
+      end
+
+      check_entities = lambda do |entities, current_tr, parent_layer_name|
         entities.each do |e|
           next unless e.valid?
+          ent_layer = (e.respond_to?(:layer) && e.layer) ? e.layer.name.to_s : nil
+          eff_layer = (ent_layer && ent_layer != '0' && ent_layer.downcase != 'layer0') ? ent_layer : parent_layer_name
+
+          # NEVER erase genuine property boundary lines
+          next if is_property_layer.call(eff_layer)
+
           if e.is_a?(Sketchup::Edge)
             p1 = e.start.position.transform(current_tr)
             p2 = e.end.position.transform(current_tr)
             if (p1.x < min_x || p1.x > max_x || p1.y < min_y || p1.y > max_y) ||
-               (p2.x < min_x || p2.x > max_x || p2.y < min_y || p2.y > max_y) ||
-               e.length > 2000.0
+               (p2.x < min_x || p2.x > max_x || p2.y < min_y || p2.y > max_y)
               to_erase << e
             end
           elsif e.is_a?(Sketchup::ConstructionPoint)
@@ -1256,13 +1281,22 @@ module QuickDraft
             if p && (p.x < min_x || p.x > max_x || p.y < min_y || p.y > max_y)
               to_erase << e
             end
+          elsif e.is_a?(Sketchup::ComponentInstance)
+            p = e.transformation.origin.transform(current_tr)
+            if p.x < min_x || p.x > max_x || p.y < min_y || p.y > max_y
+              to_erase << e
+            else
+              inst_layer = (e.layer && e.layer.name != '0' && e.layer.name.downcase != 'layer0') ? e.layer.name.to_s : parent_layer_name
+              check_entities.call(e.definition.entities, current_tr * e.transformation, inst_layer)
+            end
           elsif e.is_a?(Sketchup::Group)
-            check_entities.call(e.entities, current_tr * e.transformation)
+            grp_layer = (e.layer && e.layer.name != '0' && e.layer.name.downcase != 'layer0') ? e.layer.name.to_s : parent_layer_name
+            check_entities.call(e.entities, current_tr * e.transformation, grp_layer)
           end
         end
       end
 
-      check_entities.call(survey_group.entities, tr)
+      check_entities.call(survey_group.entities, tr, nil)
 
       to_erase.uniq.each do |ent|
         ent.erase! if ent.valid? rescue nil
@@ -1273,7 +1307,25 @@ module QuickDraft
         grp.erase! if grp.valid? && grp.entities.empty? rescue nil
       end
 
-      puts "QuickDraft: Culled #{to_erase.size} distant off-site surveyor tie lines/points. Site_Survey_2D bounding box tightly framed to drawing sheet."
+      puts "QuickDraft: Culled #{to_erase.size} distant off-site entities. Site_Survey_2D bounding box tightly framed to drawing sheet."
+    end
+
+    def self.combine_into_site_all(model, groups)
+      valid_groups = groups.compact.select { |g| g.valid? }
+      return nil if valid_groups.empty?
+
+      tag_site_all = ensure_tag(model, TAG_SITE_ALL, Sketchup::Color.new(30, 110, 180))
+      tag_site_all.visible = true if tag_site_all.respond_to?(:visible=)
+
+      # Also ensure 'Terrain' tag exists as an alias for users preferring 'Terrain'
+      tag_terrain = ensure_tag(model, 'Terrain', Sketchup::Color.new(160, 190, 140))
+      tag_terrain.visible = true if tag_terrain.respond_to?(:visible=)
+
+      master_group = model.active_entities.add_group(valid_groups)
+      master_group.name = MASTER_GROUP_NAME
+      master_group.layer = tag_site_all
+      puts "QuickDraft: Combined #{valid_groups.size} site components into master group '#{MASTER_GROUP_NAME}' on tag '#{TAG_SITE_ALL}'."
+      master_group
     end
 
     def self.get_property_bounds(survey_group, property_layers)
@@ -1282,22 +1334,25 @@ module QuickDraft
       prop_box = Geom::BoundingBox.new
       tr = survey_group.transformation
 
-      collect_prop_pts = lambda do |entities, current_tr|
+      collect_prop_pts = lambda do |entities, current_tr, parent_layer|
         entities.each do |entity|
           if entity.is_a?(Sketchup::Edge)
-            if entity.layer && property_layers.include?(entity.layer.name)
+            lname = (entity.layer && entity.layer.name != '0' && entity.layer.name.downcase != 'layer0') ? entity.layer.name : parent_layer
+            if lname && property_layers.include?(lname)
               prop_box.add(entity.start.position.transform(current_tr))
               prop_box.add(entity.end.position.transform(current_tr))
             end
           elsif entity.is_a?(Sketchup::Group)
-            collect_prop_pts.call(entity.entities, current_tr * entity.transformation)
+            grp_layer = (entity.layer && entity.layer.name != '0' && entity.layer.name.downcase != 'layer0') ? entity.layer.name : parent_layer
+            collect_prop_pts.call(entity.entities, current_tr * entity.transformation, grp_layer)
           elsif entity.is_a?(Sketchup::ComponentInstance)
-            collect_prop_pts.call(entity.definition.entities, current_tr * entity.transformation)
+            inst_layer = (entity.layer && entity.layer.name != '0' && entity.layer.name.downcase != 'layer0') ? entity.layer.name : parent_layer
+            collect_prop_pts.call(entity.definition.entities, current_tr * entity.transformation, inst_layer)
           end
         end
       end
 
-      collect_prop_pts.call(survey_group.entities, tr)
+      collect_prop_pts.call(survey_group.entities, tr, nil)
       prop_box.empty? ? nil : prop_box
     end
 
@@ -1322,12 +1377,20 @@ module QuickDraft
       drape_from_site_design_2d(model, terrain_group, raw_lot_group)
 
       # 4. Place Tree Proxies (Filtered to property boundary buffer)
-      place_tree_proxies(model, survey_group, tree_layers, terrain_group, property_layers)
+      trees_group = place_tree_proxies(model, survey_group, tree_layers, terrain_group, property_layers)
 
       # 5. Import CAD survey text annotations integrated at normalized site coordinates
-      text_count = import_cad_text(model, survey_group, path, norm_data)
+      text_res = import_cad_text(model, survey_group, path, norm_data)
+      text_group = text_res.is_a?(Array) ? text_res[0] : nil
+      text_count = text_res.is_a?(Array) ? text_res[1] : text_res.to_i
 
-      { terrain_group: terrain_group, text_count: text_count, raw_lot_group: raw_lot_group }
+      {
+        terrain_group: terrain_group,
+        text_count: text_count,
+        raw_lot_group: raw_lot_group,
+        trees_group: trees_group,
+        text_group: text_group
+      }
     end
 
     def self.build_terrain_mesh(model, survey_group, contour_layers, property_layers = [])
@@ -1500,23 +1563,26 @@ module QuickDraft
 
       tr = survey_group.transformation
 
-      collect_lines = lambda do |entities, current_tr, target_layers|
+      collect_lines = lambda do |entities, current_tr, target_layers, parent_layer_name = nil|
         lines = []
         return lines if target_layers.nil? || target_layers.empty?
 
         entities.each do |entity|
           if entity.is_a?(Sketchup::Edge)
-            lname = entity.layer ? entity.layer.name : ''
-            if target_layers.include?(lname)
+            ent_layer = (entity.respond_to?(:layer) && entity.layer) ? entity.layer.name.to_s : nil
+            eff_layer = (ent_layer && ent_layer != '0' && ent_layer.downcase != 'layer0') ? ent_layer : parent_layer_name
+            if eff_layer && target_layers.include?(eff_layer)
               lines << [
                 entity.start.position.transform(current_tr),
                 entity.end.position.transform(current_tr)
               ]
             end
           elsif entity.is_a?(Sketchup::Group)
-            lines.concat(collect_lines.call(entity.entities, current_tr * entity.transformation, target_layers))
+            grp_layer = (entity.layer && entity.layer.name != '0' && entity.layer.name.downcase != 'layer0') ? entity.layer.name.to_s : parent_layer_name
+            lines.concat(collect_lines.call(entity.entities, current_tr * entity.transformation, target_layers, grp_layer))
           elsif entity.is_a?(Sketchup::ComponentInstance)
-            lines.concat(collect_lines.call(entity.definition.entities, current_tr * entity.transformation, target_layers))
+            inst_layer = (entity.layer && entity.layer.name != '0' && entity.layer.name.downcase != 'layer0') ? entity.layer.name.to_s : parent_layer_name
+            lines.concat(collect_lines.call(entity.definition.entities, current_tr * entity.transformation, target_layers, inst_layer))
           end
         end
         lines
@@ -1535,9 +1601,9 @@ module QuickDraft
         end
       end
 
-      prop_edges = collect_lines.call(survey_group.entities, tr, property_layers || [])
-      paved_edges = collect_lines.call(survey_group.entities, tr, paved_target)
-      bldg_edges = collect_lines.call(survey_group.entities, tr, building_layers)
+      prop_edges = collect_lines.call(survey_group.entities, tr, property_layers || [], nil)
+      paved_edges = collect_lines.call(survey_group.entities, tr, paved_target, nil)
+      bldg_edges = collect_lines.call(survey_group.entities, tr, building_layers, nil)
 
       return nil if prop_edges.empty? && paved_edges.empty? && bldg_edges.empty?
 
@@ -2035,6 +2101,7 @@ module QuickDraft
           inst.name = "#{rec[:species]} (Existing)"
         end
       end
+      trees_group
     end
 
     def self.create_or_get_tree_proxy_def(model)
