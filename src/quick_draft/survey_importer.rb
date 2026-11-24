@@ -1186,6 +1186,16 @@ module QuickDraft
       translation = Geom::Transformation.translation(Geom::Vector3d.new(-center_x, -center_y, 0))
       survey_group.transform!(translation)
 
+      # Cull distant off-site surveyor regional traverse tie lines, monuments, and shots (> 100 ft beyond property)
+      # so the bounding box of Site_Survey_2D tightly frames the actual drawing sheet.
+      half_w = target_box.width * 0.5
+      half_h = target_box.height * 0.5
+      sheet_min_x = -half_w - 1200.0
+      sheet_max_x =  half_w + 1200.0
+      sheet_min_y = -half_h - 1500.0
+      sheet_max_y =  half_h + 1200.0
+      cull_offsite_survey_entities(survey_group, sheet_min_x, sheet_max_x, sheet_min_y, sheet_max_y)
+
       dict = model.attribute_dictionary(DICT_SITE_DATA, true)
       dict['easting_offset']    = center_x.to_f
       dict['northing_offset']   = center_y.to_f
@@ -1207,6 +1217,63 @@ module QuickDraft
         prop_box: prop_box,
         buffer: buffer
       }
+    end
+
+    def self.cull_offsite_survey_entities(survey_group, min_x, max_x, min_y, max_y)
+      return unless survey_group && survey_group.valid?
+
+      # Explode any nested ComponentInstances so all entities become accessible
+      loop do
+        instances = survey_group.entities.grep(Sketchup::ComponentInstance)
+        break if instances.empty?
+        instances.each do |inst|
+          next unless inst.valid?
+          inst.explode rescue nil
+        end
+      end
+
+      tr = survey_group.transformation
+      to_erase = []
+
+      check_entities = lambda do |entities, current_tr|
+        entities.each do |e|
+          next unless e.valid?
+          if e.is_a?(Sketchup::Edge)
+            p1 = e.start.position.transform(current_tr)
+            p2 = e.end.position.transform(current_tr)
+            if (p1.x < min_x || p1.x > max_x || p1.y < min_y || p1.y > max_y) ||
+               (p2.x < min_x || p2.x > max_x || p2.y < min_y || p2.y > max_y) ||
+               e.length > 2000.0
+              to_erase << e
+            end
+          elsif e.is_a?(Sketchup::ConstructionPoint)
+            p = e.position.transform(current_tr)
+            if p.x < min_x || p.x > max_x || p.y < min_y || p.y > max_y
+              to_erase << e
+            end
+          elsif e.is_a?(Sketchup::Text)
+            p = e.point.transform(current_tr) rescue nil
+            if p && (p.x < min_x || p.x > max_x || p.y < min_y || p.y > max_y)
+              to_erase << e
+            end
+          elsif e.is_a?(Sketchup::Group)
+            check_entities.call(e.entities, current_tr * e.transformation)
+          end
+        end
+      end
+
+      check_entities.call(survey_group.entities, tr)
+
+      to_erase.uniq.each do |ent|
+        ent.erase! if ent.valid? rescue nil
+      end
+
+      # Clean up any empty groups left behind
+      survey_group.entities.grep(Sketchup::Group).each do |grp|
+        grp.erase! if grp.valid? && grp.entities.empty? rescue nil
+      end
+
+      puts "QuickDraft: Culled #{to_erase.size} distant off-site surveyor tie lines/points. Site_Survey_2D bounding box tightly framed to drawing sheet."
     end
 
     def self.get_property_bounds(survey_group, property_layers)
