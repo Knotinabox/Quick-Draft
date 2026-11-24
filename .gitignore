@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Scratch scripts and temporary analysis data
+scratch/
+
+# Build artifacts
+dist/
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.bak
+.idea/
+.vscode/
