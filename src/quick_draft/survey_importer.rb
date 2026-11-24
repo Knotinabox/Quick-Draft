@@ -266,13 +266,9 @@ module QuickDraft
         inst.explode rescue nil
       end
 
-      # Erase root traverse tie edges on Layer 0 that extend far off-site
-      survey_group.entities.grep(Sketchup::Edge).each do |edge|
-        next unless edge.valid?
-        layer_name = edge.layer ? edge.layer.name : 'Layer0'
-        if layer_name == 'Layer0' || layer_name == 'Untagged' || layer_name == '0' || layer_name == 'BORDER'
-          survey_group.entities.erase_entities(edge) rescue nil
-        end
+      # Ensure no imported CAD entity is marked hidden (AutoCAD frozen/off layer artifact)
+      survey_group.entities.each do |e|
+        e.hidden = false if e.respond_to?(:hidden=) && e.hidden?
       end
 
       tag_survey = ensure_tag(model, TAG_SURVEY_2D, Sketchup::Color.new(120, 130, 140))
@@ -286,7 +282,7 @@ module QuickDraft
       @terrain_triangles = nil
       @terrain_points = nil
       @terrain_vertex_cache = {}
-      target_names = [MASTER_GROUP_NAME, 'Site_All', 'Site-All', 'Terrain', SURVEY_GROUP_NAME, TERRAIN_GROUP_NAME, LOT_LINES_GROUP_NAME, TREES_GROUP_NAME, 'Site_Survey_Text', PAVING_GROUP_NAME, BUILDING_GROUP_NAME, RAW_LOT_GROUP_NAME]
+      target_names = [MASTER_GROUP_NAME, 'Site_All', 'Site-All', 'Terrain', SURVEY_GROUP_NAME, TERRAIN_GROUP_NAME, LOT_LINES_GROUP_NAME, TREES_GROUP_NAME, 'Site_Survey_Text', PAVING_GROUP_NAME, BUILDING_GROUP_NAME, RAW_LOT_GROUP_NAME, 'QD_Temp_Drape_Cutter']
       to_erase = []
       (model.entities.to_a + model.active_entities.to_a).uniq.each do |ent|
         next unless ent.valid?
@@ -295,6 +291,10 @@ module QuickDraft
         end
       end
       to_erase.each { |e| e.erase! if e.valid? rescue nil }
+    end
+
+    def self.clear_previous_generated_site(model)
+      cleanup_previous_run(model)
     end
 
     def self.convert_dwg_to_dxf(dwg_path)
@@ -686,9 +686,9 @@ module QuickDraft
         clean_name = lname.sub(/^[._\-]+/, '')
 
         is_building_layer = (
-          clean_name =~ /^(b|deck|sill|peak|eave|stairs|roof|foundation|tank)_(point|pt|line|lines|symb|sym|elev|num|des)$/i ||
-          clean_name =~ /^(b_lines|b_point|b_symb|deck_lines|deck_point|deck_symb|sill_point|sill_symb|stairs_line|stairs_point|peak_point|eave_point|tank_point|tank_lines)$/i ||
-          clean_name.include?('dwelling') || clean_name.include?('building') || clean_name.include?('house')
+          (clean_name =~ /^(b_lines|deck_lines|stairs_line|dwelling|building|house)$/i ||
+           clean_name =~ /^(b|dwelling|building|house)(_lines?|_line)?$/i) &&
+          clean_name !~ /(symb|sym|point|pt|elev|num|des|text|tank)/i
         )
 
         is_elevation_layer = !is_building_layer && (
@@ -814,9 +814,7 @@ module QuickDraft
         best_trees << candidate[:name] if candidate
       end
 
-      # If private driveway layer (DWAY_LINE) is present, use it exclusively for 3D driveway surface
-      dway_exclusive = best_paved.select { |l| l =~ /dway|driveway/i }
-      best_paved = dway_exclusive unless dway_exclusive.empty?
+      # Include all detected paved/asphalt/driveway layers (e.g. DWAY_LINE, ASPH_LINE)
 
       {
         layers: classified_layers.sort_by { |l| -l[:score] },
@@ -888,6 +886,9 @@ module QuickDraft
 
         model.start_operation('Build Automated 3D Site Pipeline', true)
         begin
+          # Ensure all existing model layers are visible to avoid hidden geometry collision warnings
+          model.layers.each { |l| l.visible = true if l.respond_to?(:visible=) }
+
           apply_unit_scaling(model, survey_group, unit_scale_mode)
           norm_data = normalize_site_origin(model, survey_group, path, geodetic_datum_m, property_layers)
           pipeline_res = process_survey_pipeline(model, survey_group, contour_layers, property_layers, tree_layers, paved_layers, path, norm_data, building_layers)
@@ -896,9 +897,20 @@ module QuickDraft
           trees_group   = pipeline_res.is_a?(Hash) ? pipeline_res[:trees_group] : nil
           text_group    = pipeline_res.is_a?(Hash) ? pipeline_res[:text_group] : nil
 
-          # Combine all generated site groups into one master container group and tag ('Site-All')
-          site_groups = [survey_group, terrain_group, raw_lot_group, trees_group, text_group].compact.select(&:valid?)
-          master_group = combine_into_site_all(model, site_groups)
+          # Ensure the master 'Site-All' and 'Terrain' tags exist
+          tag_site_all = ensure_tag(model, TAG_SITE_ALL, Sketchup::Color.new(30, 110, 180))
+          tag_site_all.visible = true if tag_site_all.respond_to?(:visible=)
+
+          tag_terrain = ensure_tag(model, 'Terrain', Sketchup::Color.new(160, 190, 140))
+          tag_terrain.visible = true if tag_terrain.respond_to?(:visible=)
+
+          # Nest all generated site groups into the master container group 'Site_All' on tag 'Site-All'
+          valid_groups = [survey_group, terrain_group, raw_lot_group, trees_group, text_group].compact.select(&:valid?)
+          if valid_groups.size >= 1
+            master_group = model.active_entities.add_group(valid_groups)
+            master_group.name = MASTER_GROUP_NAME
+            master_group.layer = tag_site_all
+          end
 
           # Ensure all automated 3D site tags are active and visible in the model
           [TAG_SITE_ALL, 'Terrain', TAG_TERRAIN, TAG_PROPERTY_LINE, TAG_TREES, TAG_SURVEY_2D, TAG_SURVEY_TEXT, TAG_DRIVEWAY, TAG_BUILDING_FOOTPRINT, TAG_DESIGN_2D].each do |tag_name|
@@ -951,6 +963,76 @@ module QuickDraft
 
       dialog.center
       dialog.show
+    end
+
+    def self.rebuild_current_site(model = Sketchup.active_model)
+      return unless model
+
+      # Exit any open group editing session to avoid merging into parent context
+      model.close_active while model.active_path
+
+      dict = model.attribute_dictionary(DICT_SITE_DATA)
+      path = dict ? dict['dwg_path'] : nil
+      unless path && File.exist?(path.to_s)
+        run
+        return
+      end
+
+      contour_layers  = (dict['contour_layers']  || '').split(';').reject(&:empty?)
+      property_layers = (dict['property_layers'] || '').split(';').reject(&:empty?)
+      tree_layers     = (dict['tree_layers']     || '').split(';').reject(&:empty?)
+      paved_layers    = (dict['paved_layers']    || '').split(';').reject(&:empty?)
+      building_layers = (dict['building_layers'] || '').split(';').reject(&:empty?)
+      unit_scale_mode = dict['unit_scale_mode']  || 'as_imported'
+      geodetic_datum_m = (dict['geodetic_datum_m'] || 0.0).to_f
+
+      clear_previous_generated_site(model)
+      survey_group = import_and_isolate_cad(model, path)
+      unless survey_group && survey_group.valid?
+        UI.messagebox("Failed to re-import CAD survey from:\n#{path}")
+        return
+      end
+
+      model.start_operation('Rebuild 3D Site Pipeline', true)
+      begin
+        model.layers.each { |l| l.visible = true if l.respond_to?(:visible=) }
+        apply_unit_scaling(model, survey_group, unit_scale_mode)
+        norm_data = normalize_site_origin(model, survey_group, path, geodetic_datum_m, property_layers)
+        pipeline_res = process_survey_pipeline(model, survey_group, contour_layers, property_layers, tree_layers, paved_layers, path, norm_data, building_layers)
+
+        terrain_group = pipeline_res.is_a?(Hash) ? pipeline_res[:terrain_group] : nil
+        raw_lot_group = pipeline_res.is_a?(Hash) ? pipeline_res[:raw_lot_group] : nil
+        trees_group   = pipeline_res.is_a?(Hash) ? pipeline_res[:trees_group] : nil
+        text_group    = pipeline_res.is_a?(Hash) ? pipeline_res[:text_group] : nil
+
+        tag_site_all = ensure_tag(model, TAG_SITE_ALL, Sketchup::Color.new(30, 110, 180))
+        valid_groups = [survey_group, terrain_group, raw_lot_group, trees_group, text_group].compact.select(&:valid?)
+        if valid_groups.size >= 1
+          master_group = model.active_entities.add_group(valid_groups)
+          master_group.name = MASTER_GROUP_NAME
+          master_group.layer = tag_site_all
+        end
+
+        [TAG_SITE_ALL, 'Terrain', TAG_TERRAIN, TAG_PROPERTY_LINE, TAG_TREES, TAG_SURVEY_2D, TAG_SURVEY_TEXT, TAG_DRIVEWAY, TAG_BUILDING_FOOTPRINT, TAG_DESIGN_2D].each do |tag_name|
+          tag = model.layers[tag_name]
+          tag.visible = true if tag && tag.respond_to?(:visible=)
+        end
+
+        aerial_dict = model.attribute_dictionary('QuickDraft_Aerial')
+        if aerial_dict && aerial_dict['image_path'] && File.exist?(aerial_dict['image_path'].to_s)
+          w  = aerial_dict['world_width_ft'].to_f
+          ox = aerial_dict['offset_x_ft'].to_f
+          oy = aerial_dict['offset_y_ft'].to_f
+          r  = aerial_dict['rot_deg'].to_f
+          reproject_aerial_texture(model, terrain_group, aerial_dict['image_path'].to_s, w, ox, oy, r)
+        end
+
+        model.commit_operation
+        UI.messagebox("QuickDraft Site Rebuild Complete!\n\nAll building footprints, driveway, and 3D terrain have been re-generated with clean closed geometry.")
+      rescue StandardError => e
+        model.abort_operation
+        UI.messagebox("QuickDraft Rebuild Error:\n\n#{e.message}\n\n#{e.backtrace.first(5).join("\n")}")
+      end
     end
 
     def self.generate_mapping_html(analysis, guessed_contours, guessed_property, guessed_trees, guessed_paved, guessed_building, needs_metric, benchmark_m, w, h)
@@ -1310,24 +1392,6 @@ module QuickDraft
       puts "QuickDraft: Culled #{to_erase.size} distant off-site entities. Site_Survey_2D bounding box tightly framed to drawing sheet."
     end
 
-    def self.combine_into_site_all(model, groups)
-      valid_groups = groups.compact.select { |g| g.valid? }
-      return nil if valid_groups.empty?
-
-      tag_site_all = ensure_tag(model, TAG_SITE_ALL, Sketchup::Color.new(30, 110, 180))
-      tag_site_all.visible = true if tag_site_all.respond_to?(:visible=)
-
-      # Also ensure 'Terrain' tag exists as an alias for users preferring 'Terrain'
-      tag_terrain = ensure_tag(model, 'Terrain', Sketchup::Color.new(160, 190, 140))
-      tag_terrain.visible = true if tag_terrain.respond_to?(:visible=)
-
-      master_group = model.active_entities.add_group(valid_groups)
-      master_group.name = MASTER_GROUP_NAME
-      master_group.layer = tag_site_all
-      puts "QuickDraft: Combined #{valid_groups.size} site components into master group '#{MASTER_GROUP_NAME}' on tag '#{TAG_SITE_ALL}'."
-      master_group
-    end
-
     def self.get_property_bounds(survey_group, property_layers)
       return nil if property_layers.nil? || property_layers.empty?
 
@@ -1366,6 +1430,7 @@ module QuickDraft
       dict['tree_layers']     = tree_layers.join(';')
       dict['paved_layers']    = paved_layers.join(';')
       dict['building_layers'] = building_layers.join(';')
+      dict['unit_scale_mode'] ||= 'as_imported'
 
       # 1. Build 3D Terrain as a single, clean TIN mesh directly in terrain_group.entities
       terrain_group = build_terrain_mesh(model, survey_group, contour_layers, property_layers)
@@ -1374,10 +1439,10 @@ module QuickDraft
       raw_lot_group = create_raw_lot_design_2d(model, survey_group, property_layers, paved_layers, building_layers, terrain_group)
 
       # 3. Drape Linework & Features directly from Site_Raw_Lot_Design_2D onto Site_Terrain
-      drape_from_site_design_2d(model, terrain_group, raw_lot_group)
+      bldg_polys = drape_from_site_design_2d(model, terrain_group, raw_lot_group)
 
-      # 4. Place Tree Proxies (Filtered to property boundary buffer)
-      trees_group = place_tree_proxies(model, survey_group, tree_layers, terrain_group, property_layers)
+      # 4. Place Tree Proxies (Filtered to property boundary buffer and excluding building footprints)
+      trees_group = place_tree_proxies(model, survey_group, tree_layers, terrain_group, property_layers, bldg_polys)
 
       # 5. Import CAD survey text annotations integrated at normalized site coordinates
       text_res = import_cad_text(model, survey_group, path, norm_data)
@@ -1539,8 +1604,8 @@ module QuickDraft
       terrain_group.entities.grep(Sketchup::Edge).each do |edge|
         next unless edge.valid?
         edge.layer = tag_terrain
-        edge.soft = true rescue nil
-        edge.smooth = true rescue nil
+        edge.soft = false rescue nil
+        edge.smooth = false rescue nil
       end
 
       terrain_group
@@ -1563,85 +1628,367 @@ module QuickDraft
 
       tr = survey_group.transformation
 
-      collect_lines = lambda do |entities, current_tr, target_layers, parent_layer_name = nil|
-        lines = []
-        return lines if target_layers.nil? || target_layers.empty?
+      collect_lines_by_layer = lambda do |entities, current_tr, target_layers, parent_layer_name = nil|
+        by_layer = Hash.new { |h, k| h[k] = [] }
+        return by_layer if target_layers.nil? || target_layers.empty?
 
         entities.each do |entity|
           if entity.is_a?(Sketchup::Edge)
             ent_layer = (entity.respond_to?(:layer) && entity.layer) ? entity.layer.name.to_s : nil
             eff_layer = (ent_layer && ent_layer != '0' && ent_layer.downcase != 'layer0') ? ent_layer : parent_layer_name
+            # Strictly exclude symbol, elevation point, description, distance, bearing, leader, and text layers
+            next if eff_layer =~ /(symb|sym|point|pt|elev|num|des|text|distance|dist|bearing|dim|leader|arrow|label|anno|note)/i
             if eff_layer && target_layers.include?(eff_layer)
-              lines << [
+              by_layer[eff_layer] << [
                 entity.start.position.transform(current_tr),
                 entity.end.position.transform(current_tr)
               ]
             end
           elsif entity.is_a?(Sketchup::Group)
             grp_layer = (entity.layer && entity.layer.name != '0' && entity.layer.name.downcase != 'layer0') ? entity.layer.name.to_s : parent_layer_name
-            lines.concat(collect_lines.call(entity.entities, current_tr * entity.transformation, target_layers, grp_layer))
+            next if grp_layer =~ /(symb|sym|point|pt|elev|num|des|text|cross|mark|tick|distance|dist|bearing|dim|leader|arrow|label|anno|note)/i
+            next if entity.bounds.diagonal < 36.0
+            sub = collect_lines_by_layer.call(entity.entities, current_tr * entity.transformation, target_layers, grp_layer)
+            sub.each { |k, v| by_layer[k].concat(v) }
           elsif entity.is_a?(Sketchup::ComponentInstance)
             inst_layer = (entity.layer && entity.layer.name != '0' && entity.layer.name.downcase != 'layer0') ? entity.layer.name.to_s : parent_layer_name
-            lines.concat(collect_lines.call(entity.definition.entities, current_tr * entity.transformation, target_layers, inst_layer))
+            def_name = entity.definition.name.to_s.downcase
+            # Strictly skip any survey symbol, crosshair, or point marker (e.g. B_SYMB, ICM_UMP, + hash points)
+            next if inst_layer =~ /(symb|sym|point|pt|elev|num|des|text|cross|mark|tick|distance|dist|bearing|dim|leader|arrow|label|anno|note)/i || def_name =~ /(symb|sym|point|pt|icm_|ump|marker|cross|tick|arrow|leader)/i
+            next if entity.bounds.diagonal < 36.0
+            sub = collect_lines_by_layer.call(entity.definition.entities, current_tr * entity.transformation, target_layers, inst_layer)
+            sub.each { |k, v| by_layer[k].concat(v) }
           end
         end
-        lines
+        by_layer
       end
 
-      dway_paved = paved_layers ? paved_layers.select { |l| l =~ /dway|driveway/i } : []
-      paved_target = dway_paved.empty? ? (paved_layers || []) : dway_paved
+      paved_target = paved_layers || []
 
       if building_layers.nil? || building_layers.empty?
         building_layers = []
         survey_group.entities.each do |e|
           l = e.layer ? e.layer.name : nil
-          if l && l.downcase =~ /^(b_lines|deck_lines|stairs_line|tank_lines|dwelling|building)/i
+          if l && l.downcase =~ /^(b_lines|deck_lines|stairs_line|dwelling|building)/i && l.downcase !~ /(symb|sym|point|pt|elev|num|des|text|tank)/i
             building_layers << l unless building_layers.include?(l)
           end
         end
       end
 
-      prop_edges = collect_lines.call(survey_group.entities, tr, property_layers || [], nil)
-      paved_edges = collect_lines.call(survey_group.entities, tr, paved_target, nil)
-      bldg_edges = collect_lines.call(survey_group.entities, tr, building_layers, nil)
+      prop_by_layer = collect_lines_by_layer.call(survey_group.entities, tr, property_layers || [], nil)
+      paved_by_layer = collect_lines_by_layer.call(survey_group.entities, tr, paved_target, nil)
+      bldg_by_layer = collect_lines_by_layer.call(survey_group.entities, tr, building_layers, nil)
 
-      return nil if prop_edges.empty? && paved_edges.empty? && bldg_edges.empty?
+      prop_edges = prop_by_layer.values.flatten(1)
+      paved_edges = paved_by_layer.values.flatten(1)
+      return nil if prop_edges.empty? && paved_edges.empty? && bldg_by_layer.values.flatten(1).empty?
 
-      # Filter building lines strictly to the subject lot:
-      # Excludes neighbor's deck to the west (X < prop_box.min.x + 100)
-      # Excludes shoreline stairs to the north (Y > prop_box.max.y - 200)
-      # Uses a two-tier boundary to account for the angled east property line:
-      #  - Southern tier (garage area, Y <= prop_box.min.y + height * 0.68):
-      #    allows X up to min.x + width * 0.78, capturing 100% of the on-site garage/carport building
-      #    while cleanly excluding the neighbor's carport further east (X >= +834).
-      #  - Northern tier (main dwelling area, Y > prop_box.min.y + height * 0.68):
-      #    bounds X to min.x + width * 0.65, capturing 100% of the house, rooms, breezeway,
-      #    tanks, and patio, while cleanly excluding the neighbor's house across the boundary (X >= +608).
+      # Filter building & driveway lines per CAD layer strictly to the subject lot:
       prop_box = get_property_bounds(survey_group, property_layers)
       if prop_box && !prop_box.empty?
         min_bldg_x = prop_box.min.x + 100.0
         max_bldg_y = prop_box.max.y - 200.0
         garage_cutoff_y = prop_box.min.y + prop_box.height * 0.68
-        bldg_edges.select! do |p1, p2|
-          mx = (p1.x + p2.x) / 2.0
-          my = (p1.y + p2.y) / 2.0
-          max_bldg_x = (my <= garage_cutoff_y) ? (prop_box.min.x + prop_box.width * 0.78) : (prop_box.min.x + prop_box.width * 0.65)
-          mx >= min_bldg_x && mx <= max_bldg_x && my <= max_bldg_y
+        bldg_by_layer.each do |_lname, edges|
+          edges.select! do |p1, p2|
+            mx = (p1.x + p2.x) / 2.0
+            my = (p1.y + p2.y) / 2.0
+            max_bldg_x = (my <= garage_cutoff_y) ? (prop_box.min.x + prop_box.width * 0.78) : (prop_box.min.x + prop_box.width * 0.65)
+            mx >= min_bldg_x && mx <= max_bldg_x && my <= max_bldg_y
+          end
+        end
+
+        paved_buf = 300.0
+        paved_by_layer.each do |_lname, edges|
+          edges.select! do |p1, p2|
+            mx = (p1.x + p2.x) / 2.0
+            my = (p1.y + p2.y) / 2.0
+            mx >= (prop_box.min.x - paved_buf) && mx <= (prop_box.max.x + paved_buf) &&
+            my >= (prop_box.min.y - paved_buf) && my <= (prop_box.max.y + paved_buf)
+          end
         end
       end
 
-      # 1. Add property lines & bridge any open gaps <= 300"
-      bridge_2d_endpoints(design_group, tag_design, 'property', prop_edges, z_plane, 300.0)
+      # 1. Isolate Property Lines in their own sub-group (unfilled crisp 2D linework)
+      if !prop_edges.empty?
+        prop_sub = design_group.entities.add_group
+        prop_sub.name = '2D_Property'
+        prop_sub.layer = tag_design
+        bridge_2d_endpoints(prop_sub, tag_design, 'property', prop_edges, z_plane, 300.0)
+        prop_sub.entities.grep(Sketchup::Edge).each do |e|
+          e.soft = false rescue nil
+          e.smooth = false rescue nil
+          e.layer = tag_design
+        end
+      end
 
-      # 2. Add driveway lines & bridge road entrance apron gap <= 350"
-      bridge_2d_endpoints(design_group, tag_design, 'driveway', paved_edges, z_plane, 350.0)
+      # 2. Isolate Driveway / Asphalt Lines per CAD layer (unfilled crisp 2D linework)
+      if !paved_by_layer.values.flatten(1).empty?
+        paved_parent = design_group.entities.add_group
+        paved_parent.name = '2D_Driveway'
+        paved_parent.layer = tag_design
+        paved_by_layer.each do |cad_layer, layer_edges|
+          next if layer_edges.empty?
+          p_sub = paved_parent.entities.add_group
+          p_sub.name = "2D_#{cad_layer}"
+          p_sub.layer = tag_design
+          bridge_2d_endpoints(p_sub, tag_design, 'driveway', layer_edges, z_plane, 350.0)
+          p_sub.entities.grep(Sketchup::Edge).each do |e|
+            next unless e.valid?
+            e.soft = false rescue nil
+            e.smooth = false rescue nil
+            e.layer = tag_design
+          end
+        end
+      end
 
-      # 3. Add building lines & bridge door/window openings up to 250"
-      bridge_2d_endpoints(design_group, tag_design, 'building', bldg_edges, z_plane, 250.0)
+      # 3. Isolate Building Lines per CAD layer (unfilled crisp 2D linework)
+      bldg_parent = design_group.entities.add_group
+      bldg_parent.name = '2D_Buildings'
+      bldg_parent.layer = tag_design
 
-      edge_count = design_group.entities.grep(Sketchup::Edge).size
-      puts "QuickDraft: Created Raw Lot Design 2D with #{edge_count} line segments on tag '#{TAG_DESIGN_2D}' at Z=#{z_plane.round(1)}."
+      total_edges = 0
+      bldg_by_layer.each do |cad_layer, layer_edges|
+        next if layer_edges.empty?
+        layer_sub = bldg_parent.entities.add_group
+        layer_sub.name = "2D_#{cad_layer}"
+        layer_sub.layer = tag_design
+
+        add_building_edges_to_design(layer_sub, tag_design, layer_edges, z_plane)
+        layer_sub.entities.grep(Sketchup::Edge).each do |e|
+          next unless e.valid?
+          e.soft = false rescue nil
+          e.smooth = false rescue nil
+          e.layer = tag_design
+        end
+        total_edges += layer_sub.entities.grep(Sketchup::Edge).size
+      end
+
+      puts "QuickDraft: Created unfilled Raw Lot Design 2D (isolated by layer) with #{total_edges} building edges on tag '#{TAG_DESIGN_2D}' at Z=#{z_plane.round(1)}."
       design_group
+    end
+
+    def self.heal_and_split_building_edges(bldg_edges, corner_tolerance = 12.0, t_junction_tolerance = 6.0)
+      return [] if bldg_edges.nil? || bldg_edges.empty?
+
+      # 1. Split crossing segments at 2D intersections (X-intersections from CAD overlaps)
+      split_cross = bldg_edges.map { |p1, p2| [p1.clone, p2.clone] }
+      5.times do
+        changed = false
+        new_list = []
+        found_split = false
+        (0...split_cross.size).each do |i|
+          if found_split
+            new_list << split_cross[i]
+            next
+          end
+          p1, p2 = split_cross[i]
+          ipt = nil
+          other_j = -1
+          ((i + 1)...split_cross.size).each do |j|
+            p3, p4 = split_cross[j]
+            denom = (p1.x - p2.x) * (p3.y - p4.y) - (p1.y - p2.y) * (p3.x - p4.x)
+            if denom.abs > 1e-6
+              t = ((p1.x - p3.x) * (p3.y - p4.y) - (p1.y - p3.y) * (p3.x - p4.x)) / denom
+              u = -((p1.x - p2.x) * (p1.y - p3.y) - (p1.y - p2.y) * (p1.x - p3.x)) / denom
+              if t >= 0.005 && t <= 0.995 && u >= 0.005 && u <= 0.995
+                ipt = Geom::Point3d.new(p1.x + t * (p2.x - p1.x), p1.y + t * (p2.y - p1.y), p1.z)
+                other_j = j
+                break
+              end
+            end
+          end
+          if ipt
+            p3, p4 = split_cross[other_j]
+            new_list << [p1, ipt]
+            new_list << [ipt, p2]
+            split_cross[other_j] = [p3, ipt]
+            split_cross << [ipt, p4]
+            found_split = true
+            changed = true
+          else
+            new_list << split_cross[i]
+          end
+        end
+        split_cross = new_list.select { |p1, p2| Math.hypot(p1.x - p2.x, p1.y - p2.y) > 0.5 }
+        break unless changed
+      end
+
+      # 2. Snap near-miss corner vertices (gaps <= corner_tolerance inches)
+      snapped = split_cross.map { |p1, p2| [p1.clone, p2.clone] }
+      5.times do
+        changed = false
+        (0...snapped.size).each do |i|
+          ((i + 1)...snapped.size).each do |j|
+            [0, 1].each do |ei|
+              [0, 1].each do |ej|
+                d = Math.hypot(snapped[i][ei].x - snapped[j][ej].x, snapped[i][ei].y - snapped[j][ej].y)
+                if d > 0.0005 && d <= corner_tolerance
+                  mx = (snapped[i][ei].x + snapped[j][ej].x) * 0.5
+                  my = (snapped[i][ei].y + snapped[j][ej].y) * 0.5
+                  snapped[i][ei] = Geom::Point3d.new(mx, my, snapped[i][ei].z)
+                  snapped[j][ej] = Geom::Point3d.new(mx, my, snapped[j][ej].z)
+                  changed = true
+                end
+              end
+            end
+          end
+        end
+        break unless changed
+      end
+
+      valid_edges = snapped.select { |p1, p2| Math.hypot(p1.x - p2.x, p1.y - p2.y) > 0.5 }
+
+      # 3. Detect and split segments at T-junctions, AND snap incoming endpoints
+      endpoints = []
+      valid_edges.each do |p1, p2|
+        endpoints << p1 unless endpoints.any? { |pt| Math.hypot(pt.x - p1.x, pt.y - p1.y) < 0.01 }
+        endpoints << p2 unless endpoints.any? { |pt| Math.hypot(pt.x - p2.x, pt.y - p2.y) < 0.01 }
+      end
+
+      split_map = {}
+      split_edges = []
+      valid_edges.each do |p1, p2|
+        dx = p2.x - p1.x
+        dy = p2.y - p1.y
+        len_sq = dx * dx + dy * dy
+        if len_sq < 1e-4
+          split_edges << [p1, p2]
+          next
+        end
+
+        splits = []
+        endpoints.each do |pt|
+          d1 = Math.hypot(pt.x - p1.x, pt.y - p1.y)
+          d2 = Math.hypot(pt.x - p2.x, pt.y - p2.y)
+          next if d1 < 0.01 || d2 < 0.01
+
+          t = ((pt.x - p1.x) * dx + (pt.y - p1.y) * dy) / len_sq
+          next if t <= 0.005 || t >= 0.995
+
+          proj_x = p1.x + t * dx
+          proj_y = p1.y + t * dy
+          dist = Math.hypot(pt.x - proj_x, pt.y - proj_y)
+
+          if dist <= t_junction_tolerance
+            s_pt = Geom::Point3d.new(proj_x, proj_y, p1.z)
+            splits << [t, s_pt]
+            split_map[[pt.x.round(2), pt.y.round(2)]] = s_pt
+          end
+        end
+
+        if splits.empty?
+          split_edges << [p1, p2]
+        else
+          splits.sort_by! { |item| item[0] }
+          curr = p1
+          splits.each do |_t_val, split_pt|
+            split_edges << [curr, split_pt] if Math.hypot(curr.x - split_pt.x, curr.y - split_pt.y) > 0.1
+            curr = split_pt
+          end
+          split_edges << [curr, p2] if Math.hypot(curr.x - p2.x, curr.y - p2.y) > 0.1
+        end
+      end
+
+      # Snap incoming T-stem endpoints directly to the newly split vertices
+      t_healed = []
+      split_edges.each do |p1, p2|
+        k1 = [p1.x.round(2), p1.y.round(2)]
+        k2 = [p2.x.round(2), p2.y.round(2)]
+        np1 = split_map[k1] || p1
+        np2 = split_map[k2] || p2
+        if Math.hypot(np1.x - np2.x, np1.y - np2.y) > 0.5
+          t_healed << [np1, np2]
+        end
+      end
+
+      # 4. Prune tiny < 6" dead-end CAD ticks (like 5.91" stubs) while preserving all >= 6" architectural walls
+      clean_edges = t_healed
+      loop do
+        deg = Hash.new(0)
+        clean_edges.each do |p1, p2|
+          k1 = [p1.x.round(1), p1.y.round(1)]
+          k2 = [p2.x.round(1), p2.y.round(1)]
+          deg[k1] += 1
+          deg[k2] += 1
+        end
+
+        changed = false
+        new_list = []
+        clean_edges.each do |p1, p2|
+          k1 = [p1.x.round(1), p1.y.round(1)]
+          k2 = [p2.x.round(1), p2.y.round(1)]
+          len = Math.hypot(p1.x - p2.x, p1.y - p2.y)
+          if (deg[k1] == 1 || deg[k2] == 1) && len < 6.0
+            changed = true
+            next
+          end
+          new_list << [p1, p2]
+        end
+        clean_edges = new_list
+        break unless changed
+      end
+
+      # 5. Final exact vertex unification (merge any vertices within 0.1" so SketchUp sees 0.000000" shared endpoints)
+      unified_verts = []
+      unify = lambda do |pt|
+        found = unified_verts.find { |u| Math.hypot(u.x - pt.x, u.y - pt.y) < 0.1 }
+        return found if found
+        c = pt.clone
+        unified_verts << c
+        c
+      end
+
+      final_edges = []
+      clean_edges.each do |p1, p2|
+        u1 = unify.call(p1)
+        u2 = unify.call(p2)
+        final_edges << [u1, u2] if Math.hypot(u1.x - u2.x, u1.y - u2.y) > 0.5
+      end
+
+      # 6. Bridge any remaining open degree-1 vertices within 12" so deck/porch loops close 100%
+      deg_final = Hash.new(0)
+      final_edges.each { |p1, p2| deg_final[p1.object_id] += 1; deg_final[p2.object_id] += 1 }
+      open_pts = []
+      final_edges.each do |p1, p2|
+        open_pts << p1 if deg_final[p1.object_id] == 1 && !open_pts.include?(p1)
+        open_pts << p2 if deg_final[p2.object_id] == 1 && !open_pts.include?(p2)
+      end
+
+      while open_pts.size >= 2
+        best_i = -1; best_j = -1; min_d = 12.0
+        (0...open_pts.size).each do |i|
+          ((i + 1)...open_pts.size).each do |j|
+            d = Math.hypot(open_pts[i].x - open_pts[j].x, open_pts[i].y - open_pts[j].y)
+            if d < min_d
+              min_d = d; best_i = i; best_j = j
+            end
+          end
+        end
+        break if best_i < 0
+        p_a = open_pts[best_i]; p_b = open_pts[best_j]
+        open_pts.delete_at(best_j); open_pts.delete_at(best_i)
+        final_edges << [p_a, p_b] if min_d > 0.5
+      end
+
+      final_edges
+    end
+
+    def self.add_building_edges_to_design(design_group, tag_design, bldg_edges, z_plane)
+      return if bldg_edges.nil? || bldg_edges.empty?
+
+      healed_edges = heal_and_split_building_edges(bldg_edges, 12.0, 6.0)
+
+      healed_edges.each do |p1, p2|
+        next if Math.hypot(p1.x - p2.x, p1.y - p2.y) < 0.5
+        pt1 = Geom::Point3d.new(p1.x, p1.y, z_plane)
+        pt2 = Geom::Point3d.new(p2.x, p2.y, z_plane)
+        e = design_group.entities.add_line(pt1, pt2) rescue nil
+        if e
+          e.layer = tag_design
+          e.set_attribute('QuickDraft', 'feature', 'building')
+        end
+      end
     end
 
     def self.bridge_2d_endpoints(design_group, tag, feature_name, edge_list, z_plane, max_gap)
@@ -1720,7 +2067,8 @@ module QuickDraft
     end
 
     # =========================================================================
-    # Drape Linework & Features from Site_Raw_Lot_Design_2D onto Site_Terrain
+    # Direct 2D-to-Slope Stamping Pipeline
+    # Casts verified 2D design plan straight down (-Z) onto terrain slope
     # =========================================================================
     def self.drape_from_site_design_2d(model, terrain_group, raw_lot_group)
       return unless terrain_group && terrain_group.valid? && raw_lot_group && raw_lot_group.valid?
@@ -1730,7 +2078,13 @@ module QuickDraft
       tag_bldg = ensure_tag(model, TAG_BUILDING_FOOTPRINT, Sketchup::Color.new(80, 85, 95))
       tag_terrain = ensure_tag(model, TAG_TERRAIN, Sketchup::Color.new(160, 190, 140))
 
-      edges_2d = raw_lot_group.entities.grep(Sketchup::Edge).to_a
+      collect_edges_recursive = lambda do |entities|
+        list = entities.grep(Sketchup::Edge).to_a
+        entities.grep(Sketchup::Group).each { |g| list.concat(collect_edges_recursive.call(g.entities)) }
+        list
+      end
+
+      edges_2d = collect_edges_recursive.call(raw_lot_group.entities)
       return if edges_2d.empty?
 
       # 1. Separate 2D design edges by feature
@@ -1738,28 +2092,75 @@ module QuickDraft
       bldg_edges_2d = edges_2d.select { |e| e.get_attribute('QuickDraft', 'feature') == 'building' }
       paved_edges_2d = edges_2d.select { |e| e.get_attribute('QuickDraft', 'feature') == 'driveway' }
 
-      # 2. Build temporary vertical cutter curtains for draping
+      # 2. Extract clean closed boundary polygons per isolated building layer sub-group & driveway
+      bldg_polys = []
+      bldg_parent = raw_lot_group.entities.grep(Sketchup::Group).find { |g| g.name == '2D_Buildings' }
+      if bldg_parent
+        bldg_parent.entities.grep(Sketchup::Group).each do |layer_sub|
+          layer_faces = layer_sub.entities.grep(Sketchup::Face).select { |f| f.valid? && f.area >= 1440.0 }
+          if !layer_faces.empty?
+            layer_faces.each do |f|
+              bldg_polys << f.outer_loop.vertices.map { |v| [v.position.x, v.position.y] }
+            end
+          else
+            bldg_polys.concat(extract_2d_polygons(model, layer_sub.entities.grep(Sketchup::Edge).to_a))
+          end
+        end
+      else
+        bldg_polys = extract_2d_polygons(model, bldg_edges_2d)
+      end
+
+      paved_outer = []
+      paved_islands = []
+      paved_parent = raw_lot_group.entities.grep(Sketchup::Group).find { |g| g.name == '2D_Driveway' }
+      if paved_parent && !paved_parent.entities.grep(Sketchup::Group).empty?
+        paved_parent.entities.grep(Sketchup::Group).each do |p_sub|
+          po, pi = extract_driveway_polygons(model, p_sub.entities.grep(Sketchup::Edge).to_a)
+          paved_outer.concat(po)
+          paved_islands.concat(pi)
+        end
+      else
+        paved_outer, paved_islands = extract_driveway_polygons(model, paved_edges_2d)
+      end
+
+      # 3. Stamp 2D features directly INTO the single Site_Terrain mesh in-place (NO nested groups!)
       z_top = terrain_group.bounds.max.z + 300.0
       z_bottom = terrain_group.bounds.min.z - 300.0
 
       cutter_group = model.active_entities.add_group
       cutter_group.name = 'QD_Temp_Drape_Cutter'
 
-      edges_2d.each do |edge|
-        next unless edge.valid?
-        p1 = edge.start.position
-        p2 = edge.end.position
-        next if p1.distance(p2) < 0.5
+      # Build unique, watertight vertical cutter curtains from extracted polygons + property lines
+      added_cutter_segs = {}
+      add_cutter_seg = lambda do |x1, y1, x2, y2|
+        return if Math.hypot(x2 - x1, y2 - y1) < 0.5
+        k1 = [x1.round(1), y1.round(1)]
+        k2 = [x2.round(1), y2.round(1)]
+        seg_key = (k1[0] < k2[0] || (k1[0] == k2[0] && k1[1] < k2[1])) ? [k1, k2] : [k2, k1]
+        return if added_cutter_segs[seg_key]
+        added_cutter_segs[seg_key] = true
 
-        v1 = Geom::Point3d.new(p1.x, p1.y, z_top)
-        v2 = Geom::Point3d.new(p2.x, p2.y, z_top)
-        v3 = Geom::Point3d.new(p2.x, p2.y, z_bottom)
-        v4 = Geom::Point3d.new(p1.x, p1.y, z_bottom)
+        v1 = Geom::Point3d.new(x1, y1, z_top)
+        v2 = Geom::Point3d.new(x2, y2, z_top)
+        v3 = Geom::Point3d.new(x2, y2, z_bottom)
+        v4 = Geom::Point3d.new(x1, y1, z_bottom)
         cutter_group.entities.add_face(v1, v2, v3, v4) rescue nil
       end
 
-      # 3. Intersect vertical cutter ribbons into terrain_group.entities (pure line draping)
-      new_edges = terrain_group.entities.intersect_with(
+      (bldg_polys + paved_outer + paved_islands).each do |poly|
+        next if poly.nil? || poly.size < 3
+        poly.each_with_index do |p1, i|
+          p2 = poly[(i + 1) % poly.size]
+          add_cutter_seg.call(p1[0], p1[1], p2[0], p2[1])
+        end
+      end
+
+      (prop_edges_2d + bldg_edges_2d + paved_edges_2d).each do |edge|
+        next unless edge.valid?
+        add_cutter_seg.call(edge.start.position.x, edge.start.position.y, edge.end.position.x, edge.end.position.y)
+      end
+
+      terrain_group.entities.intersect_with(
         false,
         terrain_group.transformation,
         terrain_group.entities,
@@ -1768,98 +2169,324 @@ module QuickDraft
         cutter_group.entities.to_a
       ) rescue nil
 
-      # Safely erase cutter_group immediately so NO vertical curtain walls remain
       model.active_entities.erase_entities(cutter_group) rescue nil
 
-      # Split terrain faces along the new draped intersection edges
-      if new_edges && !new_edges.empty?
-        new_edges.each do |e|
-          e.find_faces rescue nil if e.valid?
-        end
-      end
-
-      # 4. Keep uniform clean terrain ground material across the mesh (no premature auto-texturing)
+      # 4. Paint all faces in the single Site_Terrain mesh
       terrain_mat = model.materials['QD_Site_Terrain'] || model.materials.add('QD_Site_Terrain')
       terrain_mat.color = Sketchup::Color.new(225, 235, 220)
 
+      asphalt_mat = model.materials['QD_Driveway_Asphalt'] || model.materials.add('QD_Driveway_Asphalt')
+      asphalt_mat.color = Sketchup::Color.new(70, 72, 75)
+
+      bldg_mat = model.materials['QD_Building_Footprint'] || model.materials.add('QD_Building_Footprint')
+      bldg_mat.color = Sketchup::Color.new(242, 244, 247)
+
       terrain_group.entities.grep(Sketchup::Face).each do |face|
         next unless face.valid?
-        # Orient all newly split faces consistently pointing UP into the sky
         face.reverse! if face.normal.z < 0
-        face.material = terrain_mat
-        face.back_material = terrain_mat
+
+        mesh = face.mesh rescue nil
+        if mesh && mesh.count_polygons > 0
+          pts = mesh.polygon_points_at(1)
+          cx = (pts[0].x + pts[1].x + pts[2].x) / 3.0
+          cy = (pts[0].y + pts[1].y + pts[2].y) / 3.0
+        else
+          cx = face.bounds.center.x
+          cy = face.bounds.center.y
+        end
+
+        is_in_bldg = bldg_polys.any? { |poly| point_in_polygon?(cx, cy, poly) }
+        is_in_paved = !is_in_bldg && paved_outer.any? do |poly|
+          in_out = point_in_polygon?(cx, cy, poly)
+          in_isl = paved_islands.any? { |ip| point_in_polygon?(cx, cy, ip) }
+          in_out && !in_isl
+        end
+
+        if is_in_bldg
+          face.material = bldg_mat
+          face.back_material = bldg_mat
+        elsif is_in_paved
+          face.material = asphalt_mat
+          face.back_material = asphalt_mat
+        else
+          face.material = terrain_mat
+          face.back_material = terrain_mat
+        end
         face.layer = tag_terrain
       end
 
-      # 5. Clean, professional edge classification & selective smoothing:
-      # - All draped design lines (building exterior/interior walls, carport, rooms, tanks, driveway curbs, property lines)
-      #   MUST remain crisp, hard, and visible on their dedicated tags.
-      # - Only internal slope triangulation edges of the hill are softened and smoothed.
-      # - Outer terrain perimeter edges stay crisp.
+      # 5. Guarantee crisp hard boundaries around every material region (zero selection leaks!)
+      edge_on_2d_line = lambda do |edge, list|
+        sx = edge.start.position.x
+        sy = edge.start.position.y
+        ex = edge.end.position.x
+        ey = edge.end.position.y
+        mx = (sx + ex) * 0.5
+        my = (sy + ey) * 0.5
+        list.any? do |le|
+          next false unless le.valid?
+          x1 = le.start.position.x; y1 = le.start.position.y
+          x2 = le.end.position.x;   y2 = le.end.position.y
+          point_to_segment_distance_sq_2d(sx, sy, x1, y1, x2, y2) < 1.0 &&
+            point_to_segment_distance_sq_2d(ex, ey, x1, y1, x2, y2) < 1.0 &&
+            point_to_segment_distance_sq_2d(mx, my, x1, y1, x2, y2) < 1.0
+        end
+      end
+
       terrain_group.entities.grep(Sketchup::Edge).each do |edge|
         next unless edge.valid?
         faces = edge.faces
 
-        mid_x = (edge.start.position.x + edge.end.position.x) / 2.0
-        mid_y = (edge.start.position.y + edge.end.position.y) / 2.0
+        # Any edge separating two different materials (e.g. driveway vs terrain, building vs terrain) MUST be hard
+        is_mat_boundary = faces.size == 2 && faces[0].material != faces[1].material
+        is_design_edge = is_mat_boundary || faces.size == 1 ||
+                         edge_on_2d_line.call(edge, bldg_edges_2d) ||
+                         edge_on_2d_line.call(edge, paved_edges_2d) ||
+                         edge_on_2d_line.call(edge, prop_edges_2d)
 
-        is_bldg = false
-        bldg_edges_2d.each do |be|
-          if point_to_segment_distance_sq_2d(mid_x, mid_y, be.start.position.x, be.start.position.y, be.end.position.x, be.end.position.y) < 9.0
-            is_bldg = true
+        if is_design_edge
+          edge.soft = false rescue nil
+          edge.smooth = false rescue nil
+        else
+          edge.soft = true rescue nil
+          edge.smooth = true rescue nil
+        end
+        edge.layer = tag_terrain
+      end
+
+      # 6. Explode temporary isolation sub-groups inside Site_Raw_Lot_Design_2D into one clean 2D group
+      loop do
+        sub_groups = raw_lot_group.entities.grep(Sketchup::Group).select(&:valid?)
+        break if sub_groups.empty?
+        sub_groups.each { |g| g.explode rescue nil }
+      end
+
+      puts "QuickDraft: Stamped all 2D areas into single unified Site_Terrain mesh on '#{TAG_TERRAIN}'."
+      bldg_polys
+    end
+
+    def self.subdivide_polygon_2d(poly, max_len = 48.0)
+      return poly if poly.nil? || poly.size < 3
+      new_poly = []
+      n = poly.size
+      (0...n).each do |i|
+        p1 = poly[i]
+        p2 = poly[(i + 1) % n]
+        x1 = p1.respond_to?(:x) ? p1.x : p1[0]
+        y1 = p1.respond_to?(:y) ? p1.y : p1[1]
+        x2 = p2.respond_to?(:x) ? p2.x : p2[0]
+        y2 = p2.respond_to?(:y) ? p2.y : p2[1]
+
+        new_poly << [x1, y1]
+        dx = x2 - x1
+        dy = y2 - y1
+        dist = Math.hypot(dx, dy)
+        if dist > max_len
+          steps = (dist / max_len).ceil
+          (1...steps).each do |s|
+            t = s / steps.to_f
+            new_poly << [x1 + t * dx, y1 + t * dy]
+          end
+        end
+      end
+      new_poly
+    end
+
+    def self.triangulate_ear_clipping(poly)
+      return [] if poly.nil? || poly.size < 3
+      n = poly.size
+
+      area = 0.0
+      (0...n).each do |i|
+        x1, y1 = poly[i][0], poly[i][1]
+        x2, y2 = poly[(i + 1) % n][0], poly[(i + 1) % n][1]
+        area += (x1 * y2 - x2 * y1)
+      end
+      verts = (area < 0) ? poly.reverse : poly.clone
+
+      is_convex = lambda do |p1, p2, p3|
+        ((p2[0] - p1[0]) * (p3[1] - p2[1]) - (p2[1] - p1[1]) * (p3[0] - p2[0])) > 1e-7
+      end
+
+      in_triangle = lambda do |pt, a, b, c|
+        sign = lambda do |p1, p2, p3|
+          (p1[0] - p3[0]) * (p2[1] - p3[1]) - (p2[0] - p3[0]) * (p1[1] - p3[1])
+        end
+        d1 = sign.call(pt, a, b)
+        d2 = sign.call(pt, b, c)
+        d3 = sign.call(pt, c, a)
+        has_neg = (d1 < -1e-7) || (d2 < -1e-7) || (d3 < -1e-7)
+        has_pos = (d1 > 1e-7) || (d2 > 1e-7) || (d3 > 1e-7)
+        !(has_neg && has_pos)
+      end
+
+      triangles = []
+      max_iter = verts.size * 4
+      iter_count = 0
+
+      while verts.size > 3 && iter_count < max_iter
+        iter_count += 1
+        ear_found = false
+        m = verts.size
+        (0...m).each do |i|
+          p_prev = verts[(i - 1) % m]
+          p_curr = verts[i]
+          p_next = verts[(i + 1) % m]
+          next unless is_convex.call(p_prev, p_curr, p_next)
+
+          has_inside = false
+          (0...m).each do |j|
+            next if j == ((i - 1) % m) || j == i || j == ((i + 1) % m)
+            if in_triangle.call(verts[j], p_prev, p_curr, p_next)
+              has_inside = true
+              break
+            end
+          end
+
+          unless has_inside
+            triangles << [p_prev, p_curr, p_next]
+            verts.delete_at(i)
+            ear_found = true
             break
           end
         end
 
-        is_paved = false
-        unless is_bldg
-          paved_edges_2d.each do |pe|
-            if point_to_segment_distance_sq_2d(mid_x, mid_y, pe.start.position.x, pe.start.position.y, pe.end.position.x, pe.end.position.y) < 9.0
-              is_paved = true
+        unless ear_found
+          (0...m).each do |i|
+            p_prev = verts[(i - 1) % m]
+            p_curr = verts[i]
+            p_next = verts[(i + 1) % m]
+            if is_convex.call(p_prev, p_curr, p_next)
+              triangles << [p_prev, p_curr, p_next]
+              verts.delete_at(i)
+              ear_found = true
               break
             end
           end
-        end
-
-        is_prop = false
-        unless is_bldg || is_paved
-          prop_edges_2d.each do |pe|
-            if point_to_segment_distance_sq_2d(mid_x, mid_y, pe.start.position.x, pe.start.position.y, pe.end.position.x, pe.end.position.y) < 9.0
-              is_prop = true
-              break
-            end
-          end
-        end
-
-        if is_bldg
-          # Crisp draped building line (exterior wall, interior room division, carport, tank, breezeway)
-          edge.layer = tag_bldg
-          edge.soft = false rescue nil
-          edge.smooth = false rescue nil
-        elsif is_paved
-          # Crisp draped driveway edge / curb
-          edge.layer = tag_paved
-          edge.soft = false rescue nil
-          edge.smooth = false rescue nil
-        elsif is_prop
-          # Crisp draped property boundary line
-          edge.layer = tag_prop
-          edge.soft = false rescue nil
-          edge.smooth = false rescue nil
-        elsif faces.size == 1
-          # Outer perimeter boundary of the terrain mesh
-          edge.layer = tag_terrain
-          edge.soft = false rescue nil
-          edge.smooth = false rescue nil
-        else
-          # Internal hill slope triangulation edge (invisible on smooth terrain surface)
-          edge.layer = tag_terrain
-          edge.soft = true rescue nil
-          edge.smooth = true rescue nil
+          break unless ear_found
         end
       end
 
-      puts "QuickDraft: Draped line drawing from Site Design 2D onto terrain mesh cleanly."
+      if verts.size == 3
+        triangles << [verts[0], verts[1], verts[2]]
+      end
+
+      triangles
+    end
+
+    def self.stamp_polygon_to_slope(model, target_group, poly, material, tag, z_offset = 1.5, islands = [])
+      return if poly.nil? || poly.size < 3
+
+      # Collect all boundary segments for edge softening check & grid clearance
+      boundary_segments = []
+      poly.each_with_index do |pt, i|
+        nxt = poly[(i + 1) % poly.size]
+        boundary_segments << [pt, nxt]
+      end
+      if islands
+        islands.each do |isl|
+          isl.each_with_index do |pt, i|
+            nxt = isl[(i + 1) % isl.size]
+            boundary_segments << [pt, nxt]
+          end
+        end
+      end
+
+      # Subdivide outer and island perimeters to 48" and add a 48" interior grid
+      # so every triangle hugs every hillside ridge/valley with zero terrain poke-through
+      sub_outer = subdivide_polygon_2d(poly, 48.0)
+      pts = sub_outer.map { |p| Geom::Point3d.new(p[0], p[1], 0.0) }
+
+      if islands
+        islands.each do |isl|
+          sub_isl = subdivide_polygon_2d(isl, 48.0)
+          sub_isl.each { |p| pts << Geom::Point3d.new(p[0], p[1], 0.0) }
+        end
+      end
+
+      xs = sub_outer.map { |p| p[0] }
+      ys = sub_outer.map { |p| p[1] }
+      min_x, max_x = xs.min, xs.max
+      min_y, max_y = ys.min, ys.max
+
+      step = 48.0
+      gx = min_x + step * 0.5
+      while gx < max_x
+        gy = min_y + step * 0.5
+        while gy < max_y
+          in_out = point_in_polygon?(gx, gy, poly)
+          in_isl = islands && islands.any? { |ip| point_in_polygon?(gx, gy, ip) }
+          if in_out && !in_isl
+            too_close = boundary_segments.any? do |bp1, bp2|
+              point_to_segment_distance_sq_2d(gx, gy, bp1[0], bp1[1], bp2[0], bp2[1]) < 144.0 # < 12"
+            end
+            pts << Geom::Point3d.new(gx, gy, 0.0) unless too_close
+          end
+          gy += step
+        end
+        gx += step
+      end
+
+      raw_tris = Delaunay.triangulate(pts)
+      triangles = []
+      raw_tris.each do |p1, p2, p3|
+        cx = (p1.x + p2.x + p3.x) / 3.0
+        cy = (p1.y + p2.y + p3.y) / 3.0
+        in_out = point_in_polygon?(cx, cy, poly)
+        in_isl = islands && islands.any? { |ip| point_in_polygon?(cx, cy, ip) }
+        if in_out && !in_isl
+          triangles << [[p1.x, p1.y], [p2.x, p2.y], [p3.x, p3.y]]
+        end
+      end
+
+      if triangles.empty?
+        triangles = triangulate_ear_clipping(sub_outer)
+      end
+
+      return if triangles.empty?
+
+      new_faces = []
+      triangles.each do |t|
+        p1, p2, p3 = t[0], t[1], t[2]
+        z1 = (sample_terrain_elevation(p1[0], p1[1]) || 0.0) + z_offset
+        z2 = (sample_terrain_elevation(p2[0], p2[1]) || 0.0) + z_offset
+        z3 = (sample_terrain_elevation(p3[0], p3[1]) || 0.0) + z_offset
+
+        v1 = Geom::Point3d.new(p1[0], p1[1], z1)
+        v2 = Geom::Point3d.new(p2[0], p2[1], z2)
+        v3 = Geom::Point3d.new(p3[0], p3[1], z3)
+
+        face = target_group.entities.add_face(v1, v2, v3) rescue nil
+        if face
+          face.reverse! if face.normal.z < 0
+          face.material = material
+          face.back_material = material
+          face.layer = tag
+          new_faces << face
+        end
+      end
+
+      # Soften internal triangle edges while keeping perimeter boundary edges crisp
+      new_faces.each do |face|
+        face.edges.each do |edge|
+          next unless edge.valid?
+          edge.layer = tag
+          mx = (edge.start.position.x + edge.end.position.x) / 2.0
+          my = (edge.start.position.y + edge.end.position.y) / 2.0
+
+          is_boundary = boundary_segments.any? do |bp1, bp2|
+            point_to_segment_distance_sq_2d(mx, my, bp1[0], bp1[1], bp2[0], bp2[1]) < 9.0 # within 3"
+          end
+
+          if is_boundary
+            edge.soft = false rescue nil
+            edge.smooth = false rescue nil
+          else
+            edge.soft = true rescue nil
+            edge.smooth = true rescue nil
+          end
+        end
+      end
     end
 
     def self.point_in_polygon?(x, y, pts)
@@ -1919,19 +2546,73 @@ module QuickDraft
       polys = []
       return polys if edges.nil? || edges.empty?
 
-      temp_grp = model.active_entities.add_group
+      # Exact planar directed half-edge face tracer (finds all minimal closed loops >= 10 sq ft,
+      # including concave deck/ramp/porch regions, without relying on SketchUp temp_grp.find_faces)
+      # Distance-based vertex clustering (< 0.5") so floating-point rounding boundaries never break a loop
+      cluster_pts = []
+      cluster_key = lambda do |x, y|
+        found = cluster_pts.find { |cx, cy| Math.hypot(cx - x, cy - y) < 0.5 }
+        return found if found
+        pt = [x.to_f, y.to_f]
+        cluster_pts << pt
+        pt
+      end
+
+      directed = {}
       edges.each do |e|
         next unless e.valid?
-        temp_grp.entities.add_line(
-          Geom::Point3d.new(e.start.position.x, e.start.position.y, 0.0),
-          Geom::Point3d.new(e.end.position.x, e.end.position.y, 0.0)
-        ) rescue nil
+        k1 = cluster_key.call(e.start.position.x, e.start.position.y)
+        k2 = cluster_key.call(e.end.position.x, e.end.position.y)
+        next if k1 == k2
+        directed[[k1, k2]] = true
+        directed[[k2, k1]] = true
       end
-      temp_grp.entities.grep(Sketchup::Edge).each { |e| e.find_faces rescue nil }
-      temp_grp.entities.grep(Sketchup::Face).each do |f|
-        polys << f.outer_loop.vertices.map { |v| [v.position.x, v.position.y] }
+
+      out_edges = Hash.new { |h, k| h[k] = [] }
+      directed.keys.each do |u, v|
+        ang = Math.atan2(v[1] - u[1], v[0] - u[0])
+        out_edges[u] << [ang, v]
       end
-      model.active_entities.erase_entities(temp_grp) rescue nil
+      out_edges.each_value { |list| list.sort_by! { |item| item[0] } }
+
+      used = {}
+      directed.keys.each do |u, v|
+        next if used[[u, v]]
+        face = [u]
+        curr_u = u
+        curr_v = v
+        loop do
+          used[[curr_u, curr_v]] = true
+          face << curr_v
+          in_ang = Math.atan2(curr_u[1] - curr_v[1], curr_u[0] - curr_v[0])
+          cands = out_edges[curr_v]
+          break if cands.nil? || cands.empty?
+
+          idx = -1
+          (cands.size - 1).downto(0) do |i|
+            if cands[i][0] < in_ang - 1e-6
+              idx = i
+              break
+            end
+          end
+          idx = cands.size - 1 if idx == -1
+          next_v = cands[idx][1]
+          break if [curr_v, next_v] == [u, v] || face.size > 200
+          curr_u = curr_v
+          curr_v = next_v
+        end
+
+        next if face.size < 4
+        area = 0.0
+        (0...(face.size - 1)).each do |i|
+          area += face[i][0] * face[i + 1][1] - face[i + 1][0] * face[i][1]
+        end
+        area *= 0.5
+        if area >= 1440.0 # >= 10 sq ft
+          polys << face[0...-1]
+        end
+      end
+
       polys
     end
 
@@ -1995,7 +2676,7 @@ module QuickDraft
     end
 
 
-    def self.place_tree_proxies(model, survey_group, tree_layers, terrain_group, property_layers = [])
+    def self.place_tree_proxies(model, survey_group, tree_layers, terrain_group, property_layers = [], bldg_polys = [])
       return if tree_layers.empty?
 
       tag_trees = ensure_tag(model, TAG_TREES, Sketchup::Color.new(45, 125, 65))
@@ -2074,6 +2755,14 @@ module QuickDraft
         end
       end
 
+      # Exclude any trees that fall geographically inside building footprints
+      if bldg_polys && !bldg_polys.empty?
+        tree_records.reject! do |rec|
+          p = rec[:pos]
+          bldg_polys.any? { |poly| point_in_polygon?(p.x, p.y, poly) }
+        end
+      end
+
       # Deduplicate trees within 24 inches to avoid placing duplicates for both _POINT and _SYMB
       unique_trees = []
       grid = {}
@@ -2105,20 +2794,29 @@ module QuickDraft
     end
 
     def self.create_or_get_tree_proxy_def(model)
-      existing = model.definitions[TREE_PROXY_DEF_NAME]
-      return existing if existing && existing.valid?
-
-      comp_def = model.definitions.add(TREE_PROXY_DEF_NAME)
+      comp_def = model.definitions[TREE_PROXY_DEF_NAME]
+      if comp_def && comp_def.valid?
+        comp_def.entities.clear!
+      else
+        comp_def = model.definitions.add(TREE_PROXY_DEF_NAME)
+      end
       comp_def.description = 'QuickDraft Existing Survey Tree Proxy'
 
       ents = comp_def.entities
 
+      # Tree dimensions: 10 ft tall trunk, slender 42" radius canopy (reduced in half from 84")
+      trunk_h  = 120.0 # 10 feet tall trunk in inches
+      canopy_r = 42.0  # Reduced in half (3.5 ft radius, 7 ft diameter)
+      canopy_h = 180.0 # 15 feet tall canopy cone
+      apex_z   = trunk_h + canopy_h # 300.0" (25 ft total height)
+
       trunk_mat = model.materials['QD_Tree_Bark'] || model.materials.add('QD_Tree_Bark')
       trunk_mat.color = Sketchup::Color.new(115, 85, 60)
 
-      base_circle = ents.add_circle(Geom::Point3d.new(0, 0, 0), Geom::Vector3d.new(0, 0, 1), 4.0, 8)
+      # 8-sided trunk cylinder (5" radius = 10" diameter trunk)
+      base_circle = ents.add_circle(Geom::Point3d.new(0, 0, 0), Geom::Vector3d.new(0, 0, 1), 5.0, 8)
       base_pts = base_circle.map { |e| e.start.position }
-      top_pts = base_pts.map { |pt| Geom::Point3d.new(pt.x, pt.y, 36.0) }
+      top_pts = base_pts.map { |pt| Geom::Point3d.new(pt.x, pt.y, trunk_h) }
 
       (0...base_pts.size).each do |i|
         next_i = (i + 1) % base_pts.size
@@ -2129,9 +2827,10 @@ module QuickDraft
       foliage_mat = model.materials['QD_Tree_Foliage'] || model.materials.add('QD_Tree_Foliage')
       foliage_mat.color = Sketchup::Color.new(90, 140, 80)
 
-      canopy_circle = ents.add_circle(Geom::Point3d.new(0, 0, 36.0), Geom::Vector3d.new(0, 0, 1), 84.0, 8)
+      # 8-sided canopy cone starting at top of trunk (Z = 120.0")
+      canopy_circle = ents.add_circle(Geom::Point3d.new(0, 0, trunk_h), Geom::Vector3d.new(0, 0, 1), canopy_r, 8)
       canopy_pts = canopy_circle.map { |e| e.start.position }
-      apex = Geom::Point3d.new(0, 0, 168.0)
+      apex = Geom::Point3d.new(0, 0, apex_z)
 
       (0...canopy_pts.size).each do |i|
         next_i = (i + 1) % canopy_pts.size
@@ -2187,6 +2886,546 @@ module QuickDraft
       return z if z
 
       fallback_z || 0.0
+    end
+
+    # =========================================================================
+    # Aerial / Satellite Photo Projection on 3D Terrain
+    # =========================================================================
+    MAT_AERIAL_TEXTURE = 'QD_Aerial_Photo'.freeze
+
+    def self.find_terrain_group(model)
+      (model.active_entities.to_a + model.entities.to_a).uniq.each do |e|
+        next unless e.valid? && e.is_a?(Sketchup::Group)
+        return e if e.name == TERRAIN_GROUP_NAME
+        if e.name == MASTER_GROUP_NAME || e.name == 'Site_All'
+          sub = e.entities.grep(Sketchup::Group).find { |g| g.name == TERRAIN_GROUP_NAME }
+          return sub if sub
+        end
+      end
+      nil
+    end
+
+    def self.find_raw_lot_group(model)
+      (model.active_entities.to_a + model.entities.to_a).uniq.each do |e|
+        next unless e.valid? && e.is_a?(Sketchup::Group)
+        return e if e.name == RAW_LOT_GROUP_NAME
+        if e.name == MASTER_GROUP_NAME || e.name == 'Site_All'
+          sub = e.entities.grep(Sketchup::Group).find { |g| g.name == RAW_LOT_GROUP_NAME }
+          return sub if sub
+        end
+      end
+      nil
+    end
+
+    @aerial_adjuster_dialog = nil
+
+    def self.find_aerial_target_box(model, terrain_group)
+      raw_lot = find_raw_lot_group(model)
+      if raw_lot && raw_lot.valid?
+        prop_sub = raw_lot.entities.grep(Sketchup::Group).find { |g| g.name == '2D_Property' }
+        prop_ents = prop_sub ? prop_sub.entities : raw_lot.entities
+        prop_edges = prop_ents.grep(Sketchup::Edge).select { |e| e.get_attribute('QuickDraft', 'feature') == 'property' }
+        unless prop_edges.empty?
+          box = Geom::BoundingBox.new
+          prop_edges.each do |e|
+            box.add(e.start.position)
+            box.add(e.end.position)
+          end
+          return box unless box.empty?
+        end
+      end
+      terrain_group.bounds
+    end
+
+    def self.reproject_aerial_texture(model, terrain_group, image_path, world_width_ft, offset_x_ft, offset_y_ft, rot_deg)
+      terrain_group = find_terrain_group(model) unless terrain_group && terrain_group.valid?
+      return unless model && terrain_group && terrain_group.valid? && image_path && File.exist?(image_path)
+
+      target_box = find_aerial_target_box(model, terrain_group)
+      cx = (target_box.min.x + target_box.max.x) * 0.5
+      cy = (target_box.min.y + target_box.max.y) * 0.5
+
+      width_in  = [world_width_ft.to_f * 12.0, 12.0].max
+      ox_in     = offset_x_ft.to_f * 12.0
+      oy_in     = offset_y_ft.to_f * 12.0
+      rot_angle = rot_deg.to_f
+
+      mat = model.materials[MAT_AERIAL_TEXTURE] || model.materials.add(MAT_AERIAL_TEXTURE)
+      mat.texture = image_path unless mat.texture && mat.texture.filename == image_path
+
+      img_w = (mat.texture && mat.texture.image_width > 0) ? mat.texture.image_width.to_f : 1.0
+      img_h = (mat.texture && mat.texture.image_height > 0) ? mat.texture.image_height.to_f : 1.0
+      aspect = (img_h > 0) ? (img_w / img_h) : 1.0
+      height_in = width_in / aspect
+      mat.texture.size = [width_in, height_in]
+
+      center_x = cx + ox_in
+      center_y = cy + oy_in
+      half_w = width_in * 0.5
+      half_h = height_in * 0.5
+
+      rad = rot_angle * Math::PI / 180.0
+      cos_a = Math.cos(rad)
+      sin_a = Math.sin(rad)
+
+      corners = [
+        [-half_w, -half_h], # SW (0, 0)
+        [ half_w, -half_h], # SE (1, 0)
+        [ half_w,  half_h], # NE (1, 1)
+        [-half_w,  half_h]  # NW (0, 1)
+      ]
+
+      pts = corners.map do |x, y|
+        xr = x * cos_a - y * sin_a + center_x
+        yr = x * sin_a + y * cos_a + center_y
+        Geom::Point3d.new(xr, yr, 0.0)
+      end
+
+      pt_array = [
+        pts[0], Geom::Point3d.new(0.0, 0.0, 0.0),
+        pts[1], Geom::Point3d.new(1.0, 0.0, 0.0),
+        pts[2], Geom::Point3d.new(1.0, 1.0, 0.0),
+        pts[3], Geom::Point3d.new(0.0, 1.0, 0.0)
+      ]
+
+      model.start_operation('Adjust Aerial Texture', true, false, true)
+      faces = terrain_group.entities.grep(Sketchup::Face)
+      faces.each do |face|
+        next unless face.valid?
+        face.position_material(mat, pt_array, true)
+        face.back_material = mat
+      end
+      model.commit_operation
+
+      dict = model.attribute_dictionary('QuickDraft_Aerial', true)
+      dict['image_path']     = image_path
+      dict['world_width_ft'] = world_width_ft.to_f
+      dict['offset_x_ft']    = offset_x_ft.to_f
+      dict['offset_y_ft']    = offset_y_ft.to_f
+      dict['rot_deg']        = rot_angle
+    end
+
+    def self.generate_aerial_adjuster_html(img_name, img_w, img_h, width_ft, ox_ft, oy_ft, rot_deg, lot_w_ft, lot_h_ft)
+      aspect = (img_h > 0) ? (img_w.to_f / img_h.to_f) : 1.0
+      <<~HTML
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <title>QuickDraft Aerial Adjuster</title>
+        <style>
+          * { box-sizing: border-box; }
+          body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            margin: 0; padding: 12px; background: #f8fafc; color: #1e293b; font-size: 13px; user-select: none;
+          }
+          .header {
+            margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid #e2e8f0;
+          }
+          .title { font-size: 15px; font-weight: 700; color: #0f172a; display: flex; align-items: center; justify-content: space-between; }
+          .subtitle { font-size: 11px; color: #64748b; margin-top: 2px; }
+          .card {
+            background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px;
+            padding: 10px 12px; margin-bottom: 10px; box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+          }
+          .row-header {
+            display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;
+          }
+          .row-title { font-weight: 600; font-size: 12px; color: #334155; text-transform: uppercase; letter-spacing: 0.5px; }
+          .badge {
+            background: #e0f2fe; color: #0284c7; padding: 2px 7px; border-radius: 4px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 600;
+          }
+          .slider-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+          input[type=range] {
+            flex: 1; height: 6px; border-radius: 3px; background: #cbd5e1; outline: none; cursor: pointer;
+          }
+          .btn-group { display: flex; gap: 4px; justify-content: center; }
+          button {
+            background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 5px;
+            padding: 6px 10px; font-size: 11px; font-weight: 600; color: #334155; cursor: pointer;
+            transition: all 0.15s ease;
+          }
+          button:hover { background: #e2e8f0; color: #0f172a; border-color: #94a3b8; }
+          button:active { background: #cbd5e1; }
+          .btn-primary { background: #0284c7; color: #ffffff; border-color: #0284c7; }
+          .btn-primary:hover { background: #0369a1; color: #ffffff; border-color: #0369a1; }
+          .btn-preset { background: #f0fdf4; color: #166534; border-color: #bbf7d0; font-weight: 700; }
+          .btn-preset:hover { background: #dcfce7; color: #14532d; border-color: #86efac; }
+          .dpad {
+            display: grid; grid-template-columns: repeat(3, 44px); grid-template-rows: repeat(3, 34px);
+            gap: 5px; justify-content: center; margin: 8px 0;
+          }
+          .dpad button {
+            font-size: 14px; padding: 0; display: flex; align-items: center; justify-content: center;
+          }
+          .step-row {
+            display: flex; justify-content: center; align-items: center; gap: 6px; margin-top: 6px;
+          }
+          .step-btn { padding: 3px 8px; font-size: 10px; border-radius: 3px; }
+          .step-btn.active { background: #0f172a; color: #fff; border-color: #0f172a; }
+          .preset-grid {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 4px;
+          }
+          .footer-actions {
+            display: flex; gap: 6px; margin-top: 14px;
+          }
+          .footer-actions button { flex: 1; padding: 8px 6px; font-size: 11px; }
+        </style>
+      </head>
+      <body>
+        <div class="header">
+          <div class="title">
+            <span>Aerial Photo Skinning</span>
+            <span style="font-size:11px; font-weight:normal; color:#0284c7;">QuickDraft</span>
+          </div>
+          <div class="subtitle" id="img-name">#{img_name} (#{img_w.to_i} &times; #{img_h.to_i} px)</div>
+        </div>
+
+        <!-- 1. SCALE CONTROLS -->
+        <div class="card">
+          <div class="row-header">
+            <span class="row-title">Scale / Width</span>
+            <span class="badge" id="width-badge">#{width_ft.round(1)} ft</span>
+          </div>
+          <div class="slider-row">
+            <input type="range" id="width-slider" min="50" max="800" step="1" value="#{width_ft.round(1)}">
+          </div>
+          <div class="btn-group">
+            <button onclick="scaleBy(0.90)">-10%</button>
+            <button onclick="scaleBy(0.98)">-2%</button>
+            <button onclick="scaleBy(1.02)">+2%</button>
+            <button onclick="scaleBy(1.10)">+10%</button>
+          </div>
+        </div>
+
+        <!-- 2. POSITION CONTROLS -->
+        <div class="card">
+          <div class="row-header">
+            <span class="row-title">Position (Nudge)</span>
+            <span class="badge" id="pos-badge">X: #{ox_ft >= 0 ? '+' : ''}#{ox_ft.round(1)} | Y: #{oy_ft >= 0 ? '+' : ''}#{oy_ft.round(1)} ft</span>
+          </div>
+          <div class="dpad">
+            <div></div>
+            <button onclick="nudge(0, 1)">&#9650;</button>
+            <div></div>
+            <button onclick="nudge(-1, 0)">&#9664;</button>
+            <button onclick="resetPos()" style="font-size:10px;">&#8226;</button>
+            <button onclick="nudge(1, 0)">&#9654;</button>
+            <div></div>
+            <button onclick="nudge(0, -1)">&#9660;</button>
+            <div></div>
+          </div>
+          <div class="step-row">
+            <span style="font-size:10px; color:#64748b; font-weight:600;">STEP:</span>
+            <button class="step-btn" onclick="setStep(20, this)">20 ft</button>
+            <button class="step-btn active" onclick="setStep(5, this)">5 ft</button>
+            <button class="step-btn" onclick="setStep(1, this)">1 ft</button>
+            <button class="step-btn" onclick="setStep(0.2, this)">0.2 ft</button>
+          </div>
+        </div>
+
+        <!-- 3. ROTATION CONTROLS -->
+        <div class="card">
+          <div class="row-header">
+            <span class="row-title">Rotation</span>
+            <span class="badge" id="rot-badge">#{rot_deg.round(1)}&deg;</span>
+          </div>
+          <div class="slider-row">
+            <input type="range" id="rot-slider" min="-180" max="180" step="0.5" value="#{rot_deg.round(1)}">
+          </div>
+          <div class="btn-group">
+            <button onclick="rotateBy(-5)">&#8634; 5&deg;</button>
+            <button onclick="rotateBy(-0.5)">&#8634; 0.5&deg;</button>
+            <button onclick="rotateBy(0.5)">&#8635; 0.5&deg;</button>
+            <button onclick="rotateBy(5)">&#8635; 5&deg;</button>
+          </div>
+        </div>
+
+        <!-- 4. QUICK PRESETS -->
+        <div class="card">
+          <div class="row-title" style="margin-bottom:6px;">Smart Alignment Presets</div>
+          <div class="preset-grid">
+            <button class="btn-preset" onclick="presetLandsEndGIS()" style="grid-column: span 2;">
+              &#10024; Lands End 618 GIS Calibrated (321.5 ft)
+            </button>
+            <button onclick="presetLotWidth()">Fit Lot Width (#{lot_w_ft.round(0)} ft)</button>
+            <button onclick="presetLotHeight()">Fit Lot Height (#{lot_h_ft.round(0)} ft)</button>
+          </div>
+        </div>
+
+        <!-- 5. FOOTER ACTIONS -->
+        <div class="footer-actions">
+          <button onclick="pickNewImage()">&#128194; Pick Image...</button>
+          <button onclick="resetTint()">&#127912; Reset Tint</button>
+          <button class="btn-primary" onclick="closeDialog()">Done</button>
+        </div>
+
+        <script>
+          let state = {
+            width_ft: #{width_ft.to_f},
+            ox_ft:    #{ox_ft.to_f},
+            oy_ft:    #{oy_ft.to_f},
+            rot_deg:  #{rot_deg.to_f},
+            step_ft:  5.0,
+            lot_w:    #{lot_w_ft.to_f},
+            lot_h:    #{lot_h_ft.to_f}
+          };
+
+          function sendUpdate() {
+            document.getElementById('width-badge').textContent = state.width_ft.toFixed(1) + ' ft';
+            document.getElementById('width-slider').value = state.width_ft;
+
+            let xSign = state.ox_ft >= 0 ? '+' : '';
+            let ySign = state.oy_ft >= 0 ? '+' : '';
+            document.getElementById('pos-badge').textContent = 'X: ' + xSign + state.ox_ft.toFixed(1) + ' | Y: ' + ySign + state.oy_ft.toFixed(1) + ' ft';
+
+            document.getElementById('rot-badge').innerHTML = state.rot_deg.toFixed(1) + '&deg;';
+            document.getElementById('rot-slider').value = state.rot_deg;
+
+            if (window.sketchup && window.sketchup.update_aerial) {
+              sketchup.update_aerial(state);
+            }
+          }
+
+          document.getElementById('width-slider').addEventListener('input', function(e) {
+            state.width_ft = parseFloat(e.target.value);
+            sendUpdate();
+          });
+
+          document.getElementById('rot-slider').addEventListener('input', function(e) {
+            state.rot_deg = parseFloat(e.target.value);
+            sendUpdate();
+          });
+
+          function scaleBy(factor) {
+            state.width_ft = Math.max(10.0, state.width_ft * factor);
+            sendUpdate();
+          }
+
+          function nudge(dx, dy) {
+            state.ox_ft += dx * state.step_ft;
+            state.oy_ft += dy * state.step_ft;
+            sendUpdate();
+          }
+
+          function resetPos() {
+            state.ox_ft = 0.0;
+            state.oy_ft = 0.0;
+            sendUpdate();
+          }
+
+          function setStep(val, btn) {
+            state.step_ft = parseFloat(val);
+            document.querySelectorAll('.step-btn').forEach(b => b.classList.remove('active'));
+            if (btn) btn.classList.add('active');
+          }
+
+          function rotateBy(deg) {
+            state.rot_deg = Math.round((state.rot_deg + deg) * 10) / 10;
+            if (state.rot_deg > 180) state.rot_deg -= 360;
+            if (state.rot_deg < -180) state.rot_deg += 360;
+            sendUpdate();
+          }
+
+          function presetLandsEndGIS() {
+            state.width_ft = 321.5;
+            state.ox_ft    = 17.8;
+            state.oy_ft    = -4.1;
+            state.rot_deg  = -0.5;
+            sendUpdate();
+          }
+
+          function presetLotWidth() {
+            state.width_ft = state.lot_w > 10 ? state.lot_w : 220.0;
+            state.ox_ft    = 0.0;
+            state.oy_ft    = 0.0;
+            sendUpdate();
+          }
+
+          function presetLotHeight() {
+            state.width_ft = (state.lot_h > 10 ? state.lot_h : 350.0) * (#{aspect});
+            state.ox_ft    = 0.0;
+            state.oy_ft    = 0.0;
+            sendUpdate();
+          }
+
+          function pickNewImage() {
+            if (window.sketchup && window.sketchup.pick_new_image) {
+              sketchup.pick_new_image();
+            }
+          }
+
+          function resetTint() {
+            if (window.sketchup && window.sketchup.reset_tint) {
+              sketchup.reset_tint();
+            }
+          }
+
+          function closeDialog() {
+            if (window.sketchup && window.sketchup.close_dialog) {
+              sketchup.close_dialog();
+            }
+          }
+        </script>
+      </body>
+      </html>
+      HTML
+    end
+
+    def self.open_aerial_adjuster_dialog_from_menu
+      model = Sketchup.active_model
+      terrain_group = find_terrain_group(model)
+      unless terrain_group && terrain_group.valid?
+        UI.messagebox("No 'Site_Terrain' object found in the model.\nPlease import a survey or build terrain first.")
+        return
+      end
+
+      dict = model.attribute_dictionary('QuickDraft_Aerial')
+      image_path = dict ? dict['image_path'] : nil
+      if image_path && File.exist?(image_path)
+        open_aerial_adjuster_dialog(model, terrain_group, image_path)
+      else
+        apply_aerial_photo_dialog(true)
+      end
+    end
+
+    def self.open_aerial_adjuster_dialog(model, terrain_group, image_path, initial_params = nil)
+      if @aerial_adjuster_dialog && @aerial_adjuster_dialog.visible?
+        @aerial_adjuster_dialog.bring_to_front
+        return
+      end
+
+      dict = model.attribute_dictionary('QuickDraft_Aerial') || {}
+      target_box = find_aerial_target_box(model, terrain_group)
+      lot_w_ft = target_box.width / 12.0
+      lot_h_ft = target_box.height / 12.0
+
+      mat = model.materials[MAT_AERIAL_TEXTURE]
+      img_w = (mat && mat.texture && mat.texture.image_width > 0) ? mat.texture.image_width.to_f : 1.0
+      img_h = (mat && mat.texture && mat.texture.image_height > 0) ? mat.texture.image_height.to_f : 1.0
+
+      is_lands_end = File.basename(image_path) =~ /Capture GIS/i || (dict['image_path'] && dict['image_path'] =~ /Lands end/i)
+      width_ft = (dict['world_width_ft'] || (initial_params ? initial_params[:width_ft] : nil) || (is_lands_end ? 321.5 : (lot_w_ft * 1.5))).to_f
+      ox_ft    = (dict['offset_x_ft']    || (initial_params ? initial_params[:ox_ft] : nil)    || (is_lands_end ? 17.8 : 0.0)).to_f
+      oy_ft    = (dict['offset_y_ft']    || (initial_params ? initial_params[:oy_ft] : nil)    || (is_lands_end ? -4.1 : 0.0)).to_f
+      rot_deg  = (dict['rot_deg']        || (initial_params ? initial_params[:rot_deg] : nil)  || (is_lands_end ? -0.5 : 0.0)).to_f
+
+      dialog = UI::HtmlDialog.new(
+        dialog_title: 'QuickDraft: Aerial Photo Adjuster',
+        preferences_key: 'QuickDraft_Aerial_Adjuster',
+        scrollable: false,
+        resizable: true,
+        width: 380,
+        height: 620,
+        min_width: 320,
+        min_height: 520
+      )
+
+      html = generate_aerial_adjuster_html(
+        File.basename(image_path),
+        img_w,
+        img_h,
+        width_ft,
+        ox_ft,
+        oy_ft,
+        rot_deg,
+        lot_w_ft,
+        lot_h_ft
+      )
+      dialog.set_html(html)
+
+      dialog.add_action_callback('update_aerial') do |_action_context, data|
+        w  = data['width_ft'].to_f
+        ox = data['ox_ft'].to_f
+        oy = data['oy_ft'].to_f
+        r  = data['rot_deg'].to_f
+        reproject_aerial_texture(model, terrain_group, image_path, w, ox, oy, r)
+      end
+
+      dialog.add_action_callback('pick_new_image') do |_action_context|
+        dialog.close rescue nil
+        @aerial_adjuster_dialog = nil
+        apply_aerial_photo_dialog(true)
+      end
+
+      dialog.add_action_callback('reset_tint') do |_action_context|
+        reset_terrain_material_dialog
+      end
+
+      dialog.add_action_callback('close_dialog') do |_action_context|
+        dialog.close rescue nil
+        @aerial_adjuster_dialog = nil
+      end
+
+      @aerial_adjuster_dialog = dialog
+      dialog.show
+    end
+
+    def self.apply_aerial_photo_dialog(force_picker = false)
+      model = Sketchup.active_model
+      terrain_group = find_terrain_group(model)
+      unless terrain_group && terrain_group.valid?
+        UI.messagebox("No 'Site_Terrain' object found in the model.\nPlease import a survey or build terrain first.")
+        return
+      end
+
+      dict = model.attribute_dictionary('QuickDraft_Aerial')
+      existing_img = dict ? dict['image_path'] : nil
+
+      if !force_picker && existing_img && File.exist?(existing_img)
+        open_aerial_adjuster_dialog(model, terrain_group, existing_img)
+        return
+      end
+
+      default_dir = ''
+      site_dict = model.attribute_dictionary(DICT_SITE_DATA)
+      if site_dict && site_dict['dwg_path'] && File.exist?(site_dict['dwg_path'].to_s)
+        default_dir = File.dirname(site_dict['dwg_path'].to_s)
+      end
+
+      image_path = UI.openpanel("Select Aerial / Satellite Photo (JPG or PNG)", default_dir, "Image Files|*.jpg;*.jpeg;*.png;*.tif;*.tiff;*.bmp;*.webp||")
+      return if image_path.nil? || !File.exist?(image_path)
+
+      target_box = find_aerial_target_box(model, terrain_group)
+      lot_w_ft = target_box.width / 12.0
+
+      is_lands_end = File.basename(image_path) =~ /Capture GIS/i || (default_dir =~ /Lands end/i)
+      initial_w   = is_lands_end ? 321.5 : (lot_w_ft * 1.5)
+      initial_ox  = is_lands_end ? 17.8 : 0.0
+      initial_oy  = is_lands_end ? -4.1 : 0.0
+      initial_rot = is_lands_end ? -0.5 : 0.0
+
+      reproject_aerial_texture(model, terrain_group, image_path, initial_w, initial_ox, initial_oy, initial_rot)
+
+      open_aerial_adjuster_dialog(model, terrain_group, image_path, {
+        width_ft: initial_w,
+        ox_ft:    initial_ox,
+        oy_ft:    initial_oy,
+        rot_deg:  initial_rot
+      })
+    end
+
+    def self.reset_terrain_material_dialog
+      model = Sketchup.active_model
+      terrain_group = find_terrain_group(model)
+      unless terrain_group && terrain_group.valid?
+        UI.messagebox("No 'Site_Terrain' object found in the model.")
+        return
+      end
+
+      model.start_operation('Reset Terrain to Architectural Tint', true)
+      mat = model.materials['QD_Site_Terrain'] || model.materials.add('QD_Site_Terrain')
+      mat.color = Sketchup::Color.new(225, 235, 220)
+
+      faces = terrain_group.entities.grep(Sketchup::Face)
+      faces.each do |face|
+        next unless face.valid?
+        face.material = mat
+        face.back_material = mat
+      end
+      model.commit_operation
+      UI.messagebox("Terrain reset to clean architectural tint (QD_Site_Terrain).")
     end
 
     def self.ensure_tag(model, tag_name, color = nil)

@@ -4,12 +4,6 @@ Sketchup.require(File.join(__dir__, 'survey_importer'))
 Sketchup.require(File.join(__dir__, 'scene_cutter'))
 Sketchup.require(File.join(__dir__, 'layout_generator'))
 
-module ::Kernel
-  def reload
-    QuickDraft::Main.reload
-  end
-end
-
 module QuickDraft
   def self.reload
     Main.reload
@@ -23,15 +17,29 @@ module QuickDraft
         load File.join(__dir__, 'survey_importer.rb')
         load File.join(__dir__, 'scene_cutter.rb')
         load File.join(__dir__, 'layout_generator.rb')
-        puts 'QuickDraft: Worker modules reloaded successfully.'
-        UI.messagebox('QuickDraft: Core modules reloaded successfully.')
+        puts 'QuickDraft: Core modules reloaded successfully.'
+
+        # Check if an existing site has already been imported in the active model
+        model = Sketchup.active_model
+        site_dict = model ? model.attribute_dictionary('QuickDraft_SiteData') : nil
+        has_site = site_dict && site_dict['dwg_path'] && File.exist?(site_dict['dwg_path'].to_s)
+
+        if has_site
+          dwg_name = File.basename(site_dict['dwg_path'].to_s)
+          res = UI.messagebox("QuickDraft core modules reloaded successfully!\n\nWould you like to re-run the 3D Site Pipeline on '#{dwg_name}' now to update your terrain and building footprints?", MB_YESNO)
+          if res == IDYES
+            QuickDraft::SurveyImporter.rebuild_current_site(model)
+          end
+        else
+          UI.messagebox("QuickDraft: Core modules reloaded successfully.\n\nClick '1. Import Surveyor DWG & Build Terrain' to generate your 3D site.")
+        end
       rescue Exception => e
-        UI.messagebox("QuickDraft Reload Error:\n\n#{e.class}: #{e.message}\n\n#{e.backtrace.first(5).join("\n")}")
+        bt = (e.backtrace || []).first(5).join("\n")
+        UI.messagebox("QuickDraft Reload Error:\n\n#{e.class}: #{e.message}\n\n#{bt}")
       ensure
         $VERBOSE = original_verbose
       end
     end
-    module_function :reload
 
     unless file_loaded?(__FILE__)
       icons_dir = File.join(__dir__, 'icons')
@@ -46,6 +54,44 @@ module QuickDraft
       cmd_import.large_icon = File.join(icons_dir, 'survey_32.png')
       cmd_import.tooltip = '1. Import Surveyor DWG & Build Terrain'
       cmd_import.status_bar_text = 'Import CAD survey, generate 3D TIN terrain, drape lot lines, and place tree proxies'
+
+      cmd_rebuild = UI::Command.new('Rebuild 3D Site Pipeline') do
+        begin
+          load File.join(__dir__, 'survey_importer.rb')
+          QuickDraft::SurveyImporter.rebuild_current_site
+        rescue Exception => e
+          bt = (e.backtrace || []).first(5).join("\n")
+          UI.messagebox("QuickDraft Rebuild Error:\n\n#{e.class}: #{e.message}\n\n#{bt}")
+        end
+      end
+      cmd_rebuild.small_icon = File.join(icons_dir, 'survey_24.png')
+      cmd_rebuild.large_icon = File.join(icons_dir, 'survey_32.png')
+      cmd_rebuild.tooltip = 'Rebuild 3D Site Pipeline (Heal Linework & Drape)'
+      cmd_rebuild.status_bar_text = 'Rebuild 3D terrain and draped building footprints with latest healed geometry'
+
+      cmd_aerial = UI::Command.new('Skin Terrain with Aerial Photo (JPG/PNG)...') do
+        QuickDraft::SurveyImporter.apply_aerial_photo_dialog
+      end
+      cmd_aerial.small_icon = File.join(icons_dir, 'aerial_24.png')
+      cmd_aerial.large_icon = File.join(icons_dir, 'aerial_32.png')
+      cmd_aerial.tooltip = 'Skin 3D Terrain with Aerial / Satellite Photo (JPG/PNG)'
+      cmd_aerial.status_bar_text = 'Project high-resolution aerial or drone photo onto 3D terrain mesh'
+
+      cmd_adjust_aerial = UI::Command.new('Adjust Aerial Photo Position / Scale...') do
+        QuickDraft::SurveyImporter.open_aerial_adjuster_dialog_from_menu
+      end
+      cmd_adjust_aerial.small_icon = File.join(icons_dir, 'aerial_24.png')
+      cmd_adjust_aerial.large_icon = File.join(icons_dir, 'aerial_32.png')
+      cmd_adjust_aerial.tooltip = 'Adjust Aerial Photo Position, Scale & Rotation'
+      cmd_adjust_aerial.status_bar_text = 'Open interactive live alignment panel to nudge scale, offset and rotation'
+
+      cmd_reset_terrain = UI::Command.new('Reset Terrain to Architectural Tint') do
+        QuickDraft::SurveyImporter.reset_terrain_material_dialog
+      end
+      cmd_reset_terrain.small_icon = File.join(icons_dir, 'aerial_24.png')
+      cmd_reset_terrain.large_icon = File.join(icons_dir, 'aerial_32.png')
+      cmd_reset_terrain.tooltip = 'Reset Terrain to clean architectural green tint'
+      cmd_reset_terrain.status_bar_text = 'Restore uniform QD_Site_Terrain material across 3D terrain'
 
       cmd_scenes = UI::Command.new('2. Cut Architectural Scenes') do
         QuickDraft::SceneCutter.run
@@ -76,6 +122,11 @@ module QuickDraft
       # -----------------------------------------------------------------------
       menu = UI.menu('Extensions').add_submenu('QuickDraft')
       menu.add_item(cmd_import)
+      menu.add_item(cmd_rebuild)
+      menu.add_item(cmd_aerial)
+      menu.add_item(cmd_adjust_aerial)
+      menu.add_item(cmd_reset_terrain)
+      menu.add_separator
       menu.add_item(cmd_scenes)
       menu.add_item(cmd_layout)
       menu.add_separator
@@ -86,6 +137,9 @@ module QuickDraft
       # -----------------------------------------------------------------------
       toolbar = UI::Toolbar.new('QuickDraft')
       toolbar.add_item(cmd_import)
+      toolbar.add_item(cmd_rebuild)
+      toolbar.add_item(cmd_aerial)
+      toolbar.add_item(cmd_adjust_aerial)
       toolbar.add_item(cmd_scenes)
       toolbar.add_item(cmd_layout)
       toolbar.add_separator
@@ -99,4 +153,8 @@ module QuickDraft
       file_loaded(__FILE__)
     end
   end
+end
+
+def qd_reload
+  QuickDraft::Main.reload
 end
