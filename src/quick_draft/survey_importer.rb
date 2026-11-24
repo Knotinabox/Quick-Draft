@@ -1331,12 +1331,12 @@ module QuickDraft
 
       collect_elevation_points.call(survey_group.entities, tr)
 
-      # Filter elevation points to an offset buffer outside the property boundaries
-      # so all perimeter points, road frontage, trees, and top-of-bank are captured,
-      # but distant off-site survey clusters (e.g. distant driveway points) are cleanly omitted.
+      # Filter elevation points to a 25 ft (300") perimeter buffer around property boundaries.
+      # Captures all perimeter points, road frontage, trees, and top-of-bank,
+      # while cleanly omitting off-site traverse hubs (e.g. MSPOINT at X=2000), distant driveways, and off-site manholes.
       prop_box = get_property_bounds(survey_group, property_layers)
       if prop_box && !prop_box.empty?
-        buffer = [[prop_box.width, prop_box.height].max * 0.35, 1000.0].max
+        buffer = 300.0
         min_x = prop_box.min.x - buffer
         max_x = prop_box.max.x + buffer
         min_y = prop_box.min.y - buffer
