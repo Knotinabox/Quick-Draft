@@ -16,6 +16,7 @@ module QuickDraft
     TAG_TREES            = 'SITE-TREES-EXISTING'.freeze
     TAG_SURVEY_2D        = 'SITE-SURVEY-2D'.freeze
     TAG_SURVEY_TEXT      = 'SITE-SURVEY-TEXT'.freeze
+    TAG_SURVEY_POINTS    = 'SITE-SURVEY-POINTS'.freeze
     TAG_DRIVEWAY         = 'SITE-DRIVEWAY-ASPHALT'.freeze
     PAVING_GROUP_NAME    = 'Site_Paved_Surfaces_3D'.freeze
 
@@ -1449,6 +1450,23 @@ module QuickDraft
       text_group = text_res.is_a?(Array) ? text_res[0] : nil
       text_count = text_res.is_a?(Array) ? text_res[1] : text_res.to_i
 
+      # 6. Move all floating 3D CAD ConstructionPoints onto a dedicated hidden tag for clean LayOut 2D views
+      tag_pts = ensure_tag(model, TAG_SURVEY_POINTS, Sketchup::Color.new(150, 150, 150))
+      move_cpoints = lambda do |ents, visited_defs = {}|
+        ents.each do |ent|
+          if ent.is_a?(Sketchup::ConstructionPoint)
+            ent.layer = tag_pts
+          elsif ent.is_a?(Sketchup::Group)
+            move_cpoints.call(ent.entities, visited_defs)
+          elsif ent.is_a?(Sketchup::ComponentInstance) && ent.definition && !visited_defs[ent.definition.object_id]
+            visited_defs[ent.definition.object_id] = true
+            move_cpoints.call(ent.definition.entities, visited_defs)
+          end
+        end
+      end
+      move_cpoints.call(survey_group.entities)
+      tag_pts.visible = false if tag_pts.respond_to?(:visible=)
+
       {
         terrain_group: terrain_group,
         text_count: text_count,
@@ -1531,20 +1549,150 @@ module QuickDraft
       # while cleanly omitting off-site traverse hubs (e.g. MSPOINT at X=2000), distant driveways, and off-site manholes.
       prop_box = get_property_bounds(survey_group, property_layers)
       if prop_box && !prop_box.empty?
-        buffer = 300.0
-        min_x = prop_box.min.x - buffer
-        max_x = prop_box.max.x + buffer
-        min_y = prop_box.min.y - buffer
-        max_y = prop_box.max.y + buffer
+        min_x = prop_box.min.x - 50.0
+        min_y = prop_box.min.y - 600.0
+        max_y = prop_box.max.y + 300.0
+        road_zone_y = prop_box.min.y + 600.0
 
         elevation_points.select! do |pt|
-          pt.x >= min_x && pt.x <= max_x && pt.y >= min_y && pt.y <= max_y
+          cur_max_x = (pt.y <= road_zone_y) ? (prop_box.max.x + 600.0) : (prop_box.max.x + 150.0)
+          pt.x >= min_x && pt.x <= cur_max_x && pt.y >= min_y && pt.y <= max_y
         end
       end
 
       # Exclude 2D spot points and symbols at or near Z=0 that cause sharp downward spikes
       # Genuine shoreline elevations in BC are >= 0.25m (10 inches); flat CAD symbols sit at 0.0"
       elevation_points.reject! { |pt| pt.z < 10.0 }
+
+      # Extend terrain mesh straight along the West & East side lot lines to meet the front road line
+      if prop_box && !prop_box.empty? && elevation_points.size >= 3
+        all_prop_segs = []
+        collect_prop_segs = lambda do |ents, cur_tr, p_lay = nil|
+          ents.each do |ent|
+            if ent.is_a?(Sketchup::Edge)
+              el = (ent.layer && ent.layer.name != '0' && ent.layer.name.downcase != 'layer0') ? ent.layer.name : p_lay
+              if el && property_layers && property_layers.include?(el)
+                q1 = ent.start.position.transform(cur_tr)
+                q2 = ent.end.position.transform(cur_tr)
+                all_prop_segs << [q1, q2] if q1.distance(q2) > 300.0
+              end
+            elsif ent.is_a?(Sketchup::Group)
+              gl = (ent.layer && ent.layer.name != '0' && ent.layer.name.downcase != 'layer0') ? ent.layer.name : p_lay
+              collect_prop_segs.call(ent.entities, cur_tr * ent.transformation, gl)
+            elsif ent.is_a?(Sketchup::ComponentInstance)
+              il = (ent.layer && ent.layer.name != '0' && ent.layer.name.downcase != 'layer0') ? ent.layer.name : p_lay
+              collect_prop_segs.call(ent.definition.entities, cur_tr * ent.transformation, il)
+            end
+          end
+        end
+        collect_prop_segs.call(survey_group.entities, tr)
+
+        front_segs = all_prop_segs.select { |q1, q2| (q2.x - q1.x).abs > 300.0 }
+        front_line = front_segs.min_by { |q1, q2| (q1.y + q2.y) * 0.5 }
+        if front_line
+          fp1, fp2 = (front_line[0].x <= front_line[1].x) ? [front_line[0], front_line[1]] : [front_line[1], front_line[0]]
+          dx = fp2.x - fp1.x
+          dy = fp2.y - fp1.y
+          len = Math.hypot(dx, dy)
+          ux = dx / len; uy = dy / len
+
+          road_depth = 420.0
+          nx = uy; ny = -ux
+          if ny > 0
+            nx = -nx; ny = -ny
+          end
+
+          s_pt = Geom::Point3d.new(fp1.x - ux * 250.0 + nx * road_depth, fp1.y - uy * 250.0 + ny * road_depth, 0.0)
+
+          # Build a straight angled East boundary that captures any neighboring front-east driveway
+          # and intersect it cleanly with the straight parallel front road line (s_pt -> e_pt).
+          east_segs = all_prop_segs.select { |q1, q2| (q2.y - q1.y).abs > 300.0 }
+          east_seg = east_segs.max_by { |q1, q2| (q1.x + q2.x) * 0.5 }
+          y_top = fp2.y + 600.0
+          if east_seg && (east_seg[1].y - east_seg[0].y).abs > 1.0
+            t_top = (y_top - east_seg[0].y) / (east_seg[1].y - east_seg[0].y)
+            x_top_lot = east_seg[0].x + t_top * (east_seg[1].x - east_seg[0].x)
+          else
+            x_top_lot = fp2.x
+          end
+          p_top = Geom::Point3d.new(x_top_lot + 150.0, y_top, 0.0)
+
+          # Find Eastmost front-east driveway point (e.g. DWAY_LINE) if present, else default +600"
+          dway_east_pt = nil
+          collect_dway_east = lambda do |ents, cur_tr, p_lay = nil|
+            ents.each do |ent|
+              if ent.is_a?(Sketchup::Edge)
+                el = (ent.layer && ent.layer.name != '0' && ent.layer.name.downcase != 'layer0') ? ent.layer.name : p_lay
+                if el && el.downcase.include?('dway')
+                  [ent.start.position, ent.end.position].each do |vp|
+                    wp = vp.transform(cur_tr)
+                    if wp.x > fp2.x && wp.y <= fp2.y + 200.0 && wp.y >= fp2.y - 400.0
+                      dway_east_pt = wp if dway_east_pt.nil? || wp.x > dway_east_pt.x
+                    end
+                  end
+                end
+              elsif ent.is_a?(Sketchup::Group)
+                gl = (ent.layer && ent.layer.name != '0' && ent.layer.name.downcase != 'layer0') ? ent.layer.name : p_lay
+                collect_dway_east.call(ent.entities, cur_tr * ent.transformation, gl)
+              elsif ent.is_a?(Sketchup::ComponentInstance)
+                il = (ent.layer && ent.layer.name != '0' && ent.layer.name.downcase != 'layer0') ? ent.layer.name : p_lay
+                collect_dway_east.call(ent.definition.entities, cur_tr * ent.transformation, il)
+              end
+            end
+          end
+          collect_dway_east.call(survey_group.entities, tr)
+
+          p_mid = if dway_east_pt
+            Geom::Point3d.new(dway_east_pt.x + 75.0, dway_east_pt.y, 0.0)
+          else
+            Geom::Point3d.new(fp2.x + 600.0, fp2.y - 65.0, 0.0)
+          end
+
+          # Intersect East angled line (p_top -> p_mid) with front road line (s_pt + t * u)
+          ex_dir = p_mid.x - p_top.x
+          ey_dir = p_mid.y - p_top.y
+          det = ex_dir * (-uy) - ey_dir * (-ux)
+          if det.abs > 1e-6
+            rhs_x = s_pt.x - p_top.x
+            rhs_y = s_pt.y - p_top.y
+            s_param = (rhs_x * (-uy) - rhs_y * (-ux)) / det
+            e_pt = Geom::Point3d.new(p_top.x + s_param * ex_dir, p_top.y + s_param * ey_dir, 0.0)
+          else
+            e_pt = Geom::Point3d.new(fp2.x + ux * 650.0 + nx * road_depth, fp2.y + uy * 650.0 + ny * road_depth, 0.0)
+          end
+
+          # Clip any existing elevation points below y_top that lie East of the straight angled East line
+          if e_pt.y < p_top.y - 1.0
+            elevation_points.reject! do |pt|
+              if pt.y <= p_top.y
+                t_clip = (pt.y - p_top.y) / (e_pt.y - p_top.y)
+                max_x_line = p_top.x + t_clip * (e_pt.x - p_top.x)
+                pt.x > max_x_line + 1.0
+              else
+                false
+              end
+            end
+          end
+
+          (0..7).each do |i|
+            t = i / 7.0
+            ex = s_pt.x + (e_pt.x - s_pt.x) * t
+            ey = s_pt.y + (e_pt.y - s_pt.y) * t
+            nearest = elevation_points.min_by { |pt| (pt.x - ex)**2 + (pt.y - ey)**2 }
+            elevation_points << Geom::Point3d.new(ex, ey, nearest.z) if nearest
+          end
+
+          # Anchor West front-lot corner and East angled-line points
+          [
+            [fp1.x - ux * 250.0, fp1.y - uy * 250.0],
+            [p_top.x, p_top.y],
+            [p_mid.x, p_mid.y]
+          ].each do |ax, ay|
+            nearest_a = elevation_points.min_by { |pt| (pt.x - ax)**2 + (pt.y - ay)**2 }
+            elevation_points << Geom::Point3d.new(ax, ay, nearest_a.z) if nearest_a
+          end
+        end
+      end
 
       if elevation_points.size < 3
         puts 'QuickDraft: Insufficient elevation points to triangulate terrain.'
@@ -1698,13 +1846,48 @@ module QuickDraft
           end
         end
 
-        paved_buf = 300.0
-        paved_by_layer.each do |_lname, edges|
-          edges.select! do |p1, p2|
-            mx = (p1.x + p2.x) / 2.0
-            my = (p1.y + p2.y) / 2.0
-            mx >= (prop_box.min.x - paved_buf) && mx <= (prop_box.max.x + paved_buf) &&
-            my >= (prop_box.min.y - paved_buf) && my <= (prop_box.max.y + paved_buf)
+        paved_by_layer.each do |lname, edges|
+          if lname =~ /asph/i
+            edges.select! do |p1, p2|
+              mx = (p1.x + p2.x) / 2.0
+              my = (p1.y + p2.y) / 2.0
+              mx >= (prop_box.min.x - 300.0) && mx <= (prop_box.max.x + 300.0) &&
+              my >= (prop_box.min.y - 600.0) && my <= (prop_box.min.y + 200.0)
+            end
+            # Extend leftmost & rightmost asphalt road endpoints parallel to the front lot line across terrain width
+            if terrain_group && !edges.empty?
+              t_min_x = terrain_group.bounds.min.x - 50.0
+              t_max_x = terrain_group.bounds.max.x + 50.0
+
+              # Compute true front lot line slope (using long horizontal/angled lot edge, dx > 300")
+              long_props = prop_edges.select { |p1, p2| (p2.x - p1.x).abs > 300.0 }
+              front_seg = (long_props.empty? ? prop_edges : long_props).min_by { |p1, p2| (p1.y + p2.y) * 0.5 }
+              if front_seg && (front_seg[1].x - front_seg[0].x).abs > 10.0
+                slope = (front_seg[1].y - front_seg[0].y) / (front_seg[1].x - front_seg[0].x)
+              else
+                slope = 0.0
+              end
+
+              all_pts = edges.flatten(1)
+              left_pt = all_pts.min_by(&:x)
+              right_pt = all_pts.max_by(&:x)
+              if left_pt && left_pt.x > t_min_x + 1.0
+                ly = left_pt.y + slope * (t_min_x - left_pt.x)
+                edges << [Geom::Point3d.new(t_min_x, ly, left_pt.z), left_pt.clone]
+              end
+              if right_pt && right_pt.x < t_max_x - 1.0
+                ry = right_pt.y + slope * (t_max_x - right_pt.x)
+                edges << [right_pt.clone, Geom::Point3d.new(t_max_x, ry, right_pt.z)]
+              end
+            end
+          else
+            # Private driveway + neighboring road apron (DWAY_LINE)
+            edges.select! do |p1, p2|
+              mx = (p1.x + p2.x) / 2.0
+              my = (p1.y + p2.y) / 2.0
+              mx >= (prop_box.min.x - 600.0) && mx <= (prop_box.max.x + 600.0) &&
+              my >= (prop_box.min.y - 600.0) && my <= (prop_box.max.y + 300.0)
+            end
           end
         end
       end
@@ -1977,7 +2160,7 @@ module QuickDraft
     def self.add_building_edges_to_design(design_group, tag_design, bldg_edges, z_plane)
       return if bldg_edges.nil? || bldg_edges.empty?
 
-      healed_edges = heal_and_split_building_edges(bldg_edges, 12.0, 6.0)
+      healed_edges = heal_and_split_building_edges(bldg_edges, 2.0, 2.0)
 
       healed_edges.each do |p1, p2|
         next if Math.hypot(p1.x - p2.x, p1.y - p2.y) < 0.5
@@ -2115,7 +2298,54 @@ module QuickDraft
       paved_parent = raw_lot_group.entities.grep(Sketchup::Group).find { |g| g.name == '2D_Driveway' }
       if paved_parent && !paved_parent.entities.grep(Sketchup::Group).empty?
         paved_parent.entities.grep(Sketchup::Group).each do |p_sub|
-          po, pi = extract_driveway_polygons(model, p_sub.entities.grep(Sketchup::Edge).to_a)
+          sub_edges = p_sub.entities.grep(Sketchup::Edge).to_a
+          po, pi = extract_driveway_polygons(model, sub_edges)
+          if po.empty? && p_sub.name =~ /asph|road/i && !sub_edges.empty?
+            # Open road-edge polyline (e.g. ASPH_LINE): close Southward past terrain bounds so the road strip gets asphalt_mat
+            adj = Hash.new { |h, k| h[k] = [] }
+            sub_edges.each do |e|
+              next unless e.valid?
+              adj[e.start] << e
+              adj[e.end] << e
+            end
+            start_v = adj.keys.min_by { |v| v.position.x }
+            if start_v
+              visited = {}
+              chain_pts = [start_v.position]
+              cur_v = start_v
+              loop do
+                nxt_e = adj[cur_v].find { |e| !visited[e] }
+                if nxt_e
+                  visited[nxt_e] = true
+                  cur_v = nxt_e.other_vertex(cur_v)
+                  chain_pts << cur_v.position
+                else
+                  rem = sub_edges.reject { |e| visited[e] }
+                  break if rem.empty?
+                  cur_p = cur_v.position
+                  best_e = rem.min_by { |e| [e.start.position.distance(cur_p), e.end.position.distance(cur_p)].min }
+                  visited[best_e] = true
+                  if best_e.start.position.distance(cur_p) <= best_e.end.position.distance(cur_p)
+                    chain_pts << best_e.start.position
+                    cur_v = best_e.end
+                  else
+                    chain_pts << best_e.end.position
+                    cur_v = best_e.start
+                  end
+                  chain_pts << cur_v.position
+                end
+              end
+              if chain_pts.size >= 2
+                road_south_y = terrain_group.bounds.min.y - 500.0
+                poly = chain_pts.map { |p| [p.x, p.y] }
+                poly << [chain_pts.last.x + 500.0, chain_pts.last.y]
+                poly << [chain_pts.last.x + 500.0, road_south_y]
+                poly << [chain_pts.first.x - 500.0, road_south_y]
+                poly << [chain_pts.first.x - 500.0, chain_pts.first.y]
+                po << poly
+              end
+            end
+          end
           paved_outer.concat(po)
           paved_islands.concat(pi)
         end
@@ -2178,8 +2408,8 @@ module QuickDraft
       asphalt_mat = model.materials['QD_Driveway_Asphalt'] || model.materials.add('QD_Driveway_Asphalt')
       asphalt_mat.color = Sketchup::Color.new(70, 72, 75)
 
-      bldg_mat = model.materials['QD_Building_Footprint'] || model.materials.add('QD_Building_Footprint')
-      bldg_mat.color = Sketchup::Color.new(242, 244, 247)
+      bldg_mat = model.materials['0131_Silver'] || model.materials['QD_Building_Footprint'] || model.materials.add('QD_Building_Footprint')
+      bldg_mat.color = Sketchup::Color.new(192, 192, 192) unless bldg_mat.name == '0131_Silver'
 
       terrain_group.entities.grep(Sketchup::Face).each do |face|
         next unless face.valid?
@@ -2608,7 +2838,7 @@ module QuickDraft
           area += face[i][0] * face[i + 1][1] - face[i + 1][0] * face[i][1]
         end
         area *= 0.5
-        if area >= 1440.0 # >= 10 sq ft
+        if area >= 144.0 # >= 1 sq ft (captures small chimneys & eave returns)
           polys << face[0...-1]
         end
       end
