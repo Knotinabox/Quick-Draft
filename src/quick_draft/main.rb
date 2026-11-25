@@ -55,6 +55,14 @@ module QuickDraft
       cmd_import.tooltip = '1. Import Surveyor DWG & Build Terrain'
       cmd_import.status_bar_text = 'Import CAD survey, generate 3D TIN terrain, drape lot lines, and place tree proxies'
 
+      cmd_import_csv = UI::Command.new('Import Survey Points (CSV)...') do
+        QuickDraft::SurveyImporter.import_csv_points_dialog
+      end
+      cmd_import_csv.small_icon = File.join(icons_dir, 'survey_24.png')
+      cmd_import_csv.large_icon = File.join(icons_dir, 'survey_32.png')
+      cmd_import_csv.tooltip = 'Import Separate Surveyor Points CSV/TXT & Rebuild Terrain'
+      cmd_import_csv.status_bar_text = 'Attach a PNEZD/PENZD survey points CSV file and merge into 3D terrain'
+
       cmd_rebuild = UI::Command.new('Rebuild 3D Site Pipeline') do
         begin
           load File.join(__dir__, 'survey_importer.rb')
@@ -122,6 +130,7 @@ module QuickDraft
       # -----------------------------------------------------------------------
       menu = UI.menu('Extensions').add_submenu('QuickDraft')
       menu.add_item(cmd_import)
+      menu.add_item(cmd_import_csv)
       menu.add_item(cmd_rebuild)
       menu.add_item(cmd_aerial)
       menu.add_item(cmd_adjust_aerial)

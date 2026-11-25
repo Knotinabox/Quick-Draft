@@ -332,12 +332,6 @@ module QuickDraft
         return expected_dxf
       end
 
-      # Fallback: check most recently modified DXF in out_dir
-      recent = Dir.glob("#{out_dir.tr('\\', '/')}/*.dxf").max_by { |f| File.mtime(f) rescue Time.at(0) }
-      if recent && File.exist?(recent)
-        return recent
-      end
-
       nil
     end
 
@@ -353,7 +347,6 @@ module QuickDraft
         dir = File.dirname(clean_path)
         base = File.basename(clean_path, '.*')
         clean_base = base.sub(/\s*\(\d+\)$/, '').strip
-        proj_code = clean_base.split(/[\s_\-]/).first.to_s.downcase
 
         candidate1 = clean_path.sub(/\.dwg$/i, '.dxf')
         candidate2 = "#{dir}/#{clean_base}.dxf"
@@ -363,31 +356,7 @@ module QuickDraft
         elsif File.exist?(candidate2)
           dxf_path = candidate2
         else
-          dxf_candidates = Dir.glob("#{dir}/*.dxf").reject { |f| File.basename(f).start_with?('~') }
-          user_home = ENV['USERPROFILE'] || ENV['HOME'] || ''
-          downloads_dir = File.join(user_home, 'Downloads').tr('\\', '/')
-          if File.directory?(downloads_dir)
-            dxf_candidates += Dir.glob("#{downloads_dir}/*.dxf").reject { |f| File.basename(f).start_with?('~') }
-          end
-
-          scored = dxf_candidates.map do |f|
-            fname = File.basename(f).downcase
-            score = 0
-            score -= 100 if fname.include?('explode')
-            score -= 50 if fname.include?('test')
-            score += 50 if proj_code.length > 1 && fname.include?(proj_code)
-            score += 40 if clean_base.length > 3 && fname.include?(clean_base.downcase[0..10])
-            score += 20 if fname.include?('ascii') || fname.include?('2010')
-            score += 10 if (File.size(f) < 5 * 1024 * 1024 rescue false)
-            [score, f]
-          end
-
-          best = scored.max_by { |s, _f| s }
-          dxf_path = best[1] if best && best[0] > 0
-        end
-
-        # 3. If no existing companion DXF was found, attempt automated background DWG-to-DXF conversion
-        if dxf_path.nil? || !File.exist?(dxf_path)
+          # Always convert the exact DWG file itself — never scan external folders like Downloads
           dxf_path = convert_dwg_to_dxf(clean_path)
         end
       end
@@ -511,7 +480,7 @@ module QuickDraft
         lay = item[:layer].to_s.upcase
         # Keep all CAD survey text: road names, water channel, adjacent lots, dwelling labels,
         # tree table, spot elevations, and legend. Only skip raw numeric surveyor point IDs.
-        next if lay.end_with?('_NUM') || lay == 'POINTNUMBER' || lay == 'BORDER' || lay == '0'
+        next if lay.end_with?('_NUM') || lay == 'POINTNUMBER' || lay == 'BORDER'
 
         # Filter out survey points/elevations that fall geographically under the Tree Table
         # (In CAD, monument 214 / 22.31 OCM sits at (926.3, 376.5) which falls inside the Tree Table sheet area)
@@ -687,8 +656,7 @@ module QuickDraft
         clean_name = lname.sub(/^[._\-]+/, '')
 
         is_building_layer = (
-          (clean_name =~ /^(b_lines|deck_lines|stairs_line|dwelling|building|house)$/i ||
-           clean_name =~ /^(b|dwelling|building|house)(_lines?|_line)?$/i) &&
+          (clean_name =~ /(^|_|\.)(b_lines|deck_lines|stairs_line|dwelling|building|house|bldg|cabin|garage|shed|deck)(_lines?|_line)?$/i) &&
           clean_name !~ /(symb|sym|point|pt|elev|num|des|text|tank)/i
         )
 
@@ -713,7 +681,7 @@ module QuickDraft
         is_utility = false if is_elevation_layer || is_tree_layer || is_prop_layer || is_paved_layer || is_building_layer
 
         if is_building_layer
-          if info[:edges] > 0 || clean_name =~ /lines?$/
+          if info[:edges] > 0 || info[:instances] > 0 || clean_name =~ /lines?|building|bldg/i
             best_building << info[:name]
           end
           info[:category] = 'building'
@@ -860,6 +828,8 @@ module QuickDraft
         min_height: 560
       )
 
+      default_csv = find_companion_points_csv(path)
+
       html = generate_mapping_html(
         analysis,
         guessed_contours,
@@ -870,9 +840,19 @@ module QuickDraft
         needs_metric,
         benchmark_m,
         raw_w.round(1),
-        raw_h.round(1)
+        raw_h.round(1),
+        default_csv
       )
       dialog.set_html(html)
+
+      dialog.add_action_callback('browse_csv_points') do |_context|
+        start_dir = File.dirname(path)
+        picked = UI.openpanel('Select Surveyor Points CSV/TXT', start_dir, 'Points Files|*.csv;*.txt||')
+        if picked && !picked.empty?
+          safe_js = picked.gsub('\\', '\\\\').gsub("'", "\\\\'")
+          dialog.execute_script("setCsvPath('#{safe_js}');")
+        end
+      end
 
       dialog.add_action_callback('process_mapping') do |_context, data|
         dialog.close
@@ -884,6 +864,7 @@ module QuickDraft
         building_layers = data['building'] || guessed_building || []
         unit_scale_mode = data['unit_scale_mode'] || 'as_imported'
         geodetic_datum_m = (data['geodetic_datum_m'] || benchmark_m).to_f
+        csv_points_path = (data['csv_points_path'] || '').to_s.strip
 
         model.start_operation('Build Automated 3D Site Pipeline', true)
         begin
@@ -892,6 +873,14 @@ module QuickDraft
 
           apply_unit_scaling(model, survey_group, unit_scale_mode)
           norm_data = normalize_site_origin(model, survey_group, path, geodetic_datum_m, property_layers)
+
+          if !csv_points_path.empty? && File.exist?(csv_points_path)
+            dict = model.attribute_dictionary(DICT_SITE_DATA, true)
+            dict['csv_points_path'] = csv_points_path
+            csv_terrain_layers = import_csv_points_to_model(model, csv_points_path, survey_group, property_layers)
+            contour_layers = (contour_layers + csv_terrain_layers).uniq
+          end
+
           pipeline_res = process_survey_pipeline(model, survey_group, contour_layers, property_layers, tree_layers, paved_layers, path, norm_data, building_layers)
           terrain_group = pipeline_res.is_a?(Hash) ? pipeline_res[:terrain_group] : nil
           raw_lot_group = pipeline_res.is_a?(Hash) ? pipeline_res[:raw_lot_group] : nil
@@ -921,8 +910,11 @@ module QuickDraft
 
           # Ensure all imported surveyor CAD layers are also visible so linework is never hidden
           model.layers.each do |l|
+            next if l.name == TAG_SURVEY_POINTS
             l.visible = true if l.respond_to?(:visible=)
           end
+          pts_tag = model.layers[TAG_SURVEY_POINTS]
+          pts_tag.visible = false if pts_tag && pts_tag.respond_to?(:visible=)
 
           model.commit_operation
           model.active_view.zoom_extents if model.active_view
@@ -986,6 +978,11 @@ module QuickDraft
       building_layers = (dict['building_layers'] || '').split(';').reject(&:empty?)
       unit_scale_mode = dict['unit_scale_mode']  || 'as_imported'
       geodetic_datum_m = (dict['geodetic_datum_m'] || 0.0).to_f
+      csv_points_path = dict['csv_points_path'].to_s.strip
+      if csv_points_path.empty? || !File.exist?(csv_points_path)
+        detected_csv = find_companion_points_csv(path)
+        csv_points_path = detected_csv.to_s
+      end
 
       clear_previous_generated_site(model)
       survey_group = import_and_isolate_cad(model, path)
@@ -999,6 +996,13 @@ module QuickDraft
         model.layers.each { |l| l.visible = true if l.respond_to?(:visible=) }
         apply_unit_scaling(model, survey_group, unit_scale_mode)
         norm_data = normalize_site_origin(model, survey_group, path, geodetic_datum_m, property_layers)
+
+        if !csv_points_path.empty? && File.exist?(csv_points_path)
+          model.attribute_dictionary(DICT_SITE_DATA, true)['csv_points_path'] = csv_points_path
+          csv_terrain_layers = import_csv_points_to_model(model, csv_points_path, survey_group, property_layers)
+          contour_layers = (contour_layers + csv_terrain_layers).uniq
+        end
+
         pipeline_res = process_survey_pipeline(model, survey_group, contour_layers, property_layers, tree_layers, paved_layers, path, norm_data, building_layers)
 
         terrain_group = pipeline_res.is_a?(Hash) ? pipeline_res[:terrain_group] : nil
@@ -1036,7 +1040,163 @@ module QuickDraft
       end
     end
 
-    def self.generate_mapping_html(analysis, guessed_contours, guessed_property, guessed_trees, guessed_paved, guessed_building, needs_metric, benchmark_m, w, h)
+    # =========================================================================
+    # External Surveyor Points CSV/TXT Support (PNEZD / PENZD)
+    # =========================================================================
+    def self.find_companion_points_csv(dwg_path)
+      return '' unless dwg_path && !dwg_path.to_s.empty?
+      dir = File.dirname(dwg_path.to_s).tr('\\', '/')
+      return '' unless Dir.exist?(dir)
+
+      csvs = Dir.glob("#{dir}/*.{csv,CSV}").select { |f| File.file?(f) }
+      return '' if csvs.empty?
+
+      stem = File.basename(dwg_path.to_s, '.*').sub(/^ACAD[-_]?/i, '').downcase
+      matched = csvs.find { |f| File.basename(f, '.*').downcase.include?(stem) || stem.include?(File.basename(f, '.*').downcase) }
+      matched || (csvs.size == 1 ? csvs.first : '')
+    end
+
+    def self.parse_survey_points_csv(csv_path)
+      return [] unless csv_path && File.exist?(csv_path)
+      in_per_m = (1.respond_to?(:m) ? 1.m.to_f : 39.37007874015748)
+      pts = []
+      order = nil # :pnezd or :penzd
+
+      File.readlines(csv_path, encoding: 'UTF-8').each do |raw_line|
+        line = raw_line.strip
+        next if line.empty? || line.start_with?('#', '//')
+        cols = line.split(',').map(&:strip)
+        next if cols.size < 4
+
+        # Header detection
+        if cols[1] !~ /\A[+-]?\d+(?:\.\d+)?\z/
+          hdr = cols.map(&:downcase)
+          n_idx = hdr.index { |c| c == 'n' || c.include?('north') || c == 'y' }
+          e_idx = hdr.index { |c| c == 'e' || c.include?('east') || c == 'x' }
+          order = :penzd if e_idx && n_idx && e_idx < n_idx
+          next
+        end
+
+        if cols.size >= 5
+          c1 = cols[1].to_f
+          c2 = cols[2].to_f
+          z_m = cols[3].to_f
+          desc = cols[4].to_s.strip
+          if order.nil?
+            if c2.abs > 1_000_000.0 && c1.abs < 1_000_000.0
+              order = :penzd
+            else
+              order = :pnezd
+            end
+          end
+          n_m, e_m = (order == :penzd) ? [c2, c1] : [c1, c2]
+          pid = cols[0]
+        else
+          n_m = cols[0].to_f
+          e_m = cols[1].to_f
+          z_m = cols[2].to_f
+          desc = cols[3].to_s.strip
+          pid = ''
+        end
+
+        pts << {
+          id: pid,
+          e_in: e_m * in_per_m,
+          n_in: n_m * in_per_m,
+          z_in: z_m * in_per_m,
+          desc: desc.empty? ? 'PT' : desc
+        }
+      end
+      pts
+    end
+
+    def self.import_csv_points_to_model(model, csv_path, survey_group = nil, property_layers = [])
+      pts = parse_survey_points_csv(csv_path)
+      return [] if pts.empty?
+
+      dict = model.attribute_dictionary(DICT_SITE_DATA)
+      off_x = dict ? dict['easting_offset'].to_f : 0.0
+      off_y = dict ? dict['northing_offset'].to_f : 0.0
+
+      avg_e = pts.map { |p| p[:e_in] }.sum / pts.size.to_f
+      avg_n = pts.map { |p| p[:n_in] }.sum / pts.size.to_f
+
+      # Exact UTM alignment if easting_offset/northing_offset are in the same coordinate frame;
+      # otherwise align CSV centroid to property/survey centroid.
+      if (avg_e - off_x).abs > 200_000.0 || (avg_n - off_y).abs > 200_000.0
+        target_cx = 0.0
+        target_cy = 0.0
+        if survey_group && survey_group.valid?
+          pb = get_property_bounds(survey_group, property_layers)
+          tb = (pb && !pb.empty?) ? pb : survey_group.bounds
+          if tb && !tb.empty?
+            target_cx = tb.center.x
+            target_cy = tb.center.y
+          end
+        end
+        off_x = avg_e - target_cx
+        off_y = avg_n - target_cy
+      end
+
+      tag_pts = ensure_tag(model, TAG_SURVEY_POINTS, Sketchup::Color.new(150, 150, 150))
+      pts_group = model.entities.grep(Sketchup::Group).find { |g| g.valid? && g.name == 'Site_Survey_Points' }
+      unless pts_group
+        pts_group = model.entities.add_group
+        pts_group.name = 'Site_Survey_Points'
+      end
+      pts_group.layer = tag_pts
+      inv_tr = pts_group.transformation.inverse
+
+      terrain_layers = []
+      pts.each do |p|
+        lx = p[:e_in] - off_x
+        ly = p[:n_in] - off_y
+        lz = p[:z_in]
+        clean_desc = p[:desc].upcase.gsub(/[^A-Z0-9_]+/, '_').gsub(/^_|_$/, '')
+        clean_desc = 'PT' if clean_desc.empty?
+        layer_name = "CSV_#{clean_desc}"
+        pt_layer = ensure_tag(model, layer_name, Sketchup::Color.new(150, 150, 150))
+        cp = pts_group.entities.add_cpoint(Geom::Point3d.new(lx, ly, lz).transform(inv_tr))
+        cp.layer = pt_layer
+
+        if clean_desc =~ /^(GRD|GROUND|TSP|TOPO|SPOT|ELEV|DTM|EG|GRADE|GS|SS)/i
+          terrain_layers << layer_name unless terrain_layers.include?(layer_name)
+        end
+      end
+
+      tag_pts.visible = false if tag_pts.respond_to?(:visible=)
+      puts "QuickDraft: Imported #{pts.size} CSV survey points into Site_Survey_Points (terrain layers: #{terrain_layers.join(', ')})."
+      terrain_layers
+    end
+
+    def self.import_csv_points_dialog
+      model = Sketchup.active_model
+      return unless model
+
+      dict = model.attribute_dictionary(DICT_SITE_DATA)
+      dwg_path = dict ? dict['dwg_path'].to_s : ''
+      start_dir = (!dwg_path.empty? && Dir.exist?(File.dirname(dwg_path))) ? File.dirname(dwg_path) : File.expand_path('~')
+      csv_path = UI.openpanel('Select Surveyor Points CSV/TXT', start_dir, 'Points Files|*.csv;*.txt||')
+      return unless csv_path && !csv_path.empty? && File.exist?(csv_path)
+
+      model.attribute_dictionary(DICT_SITE_DATA, true)['csv_points_path'] = csv_path
+      if !dwg_path.empty? && File.exist?(dwg_path)
+        rebuild_current_site
+      else
+        model.start_operation('Import Survey Points (CSV)', true)
+        begin
+          survey_group = model.entities.grep(Sketchup::Group).find { |g| g.valid? && g.name == 'Site_Survey_2D' }
+          terrain_layers = import_csv_points_to_model(model, csv_path, survey_group)
+          model.commit_operation
+          UI.messagebox("Imported survey points from:\n#{File.basename(csv_path)}\n\nTerrain layers detected: #{terrain_layers.join(', ')}")
+        rescue StandardError => e
+          model.abort_operation
+          UI.messagebox("QuickDraft CSV Import Error:\n\n#{e.message}")
+        end
+      end
+    end
+
+    def self.generate_mapping_html(analysis, guessed_contours, guessed_property, guessed_trees, guessed_paved, guessed_building, needs_metric, benchmark_m, w, h, default_csv = '')
       layers = analysis[:layers]
       ignored = analysis[:ignored_utilities]
 
@@ -1119,6 +1279,7 @@ module QuickDraft
               <div>☖ <strong>Property Boundary:</strong> #{rec_prop}</div>
               <div>🌲 <strong>Arborist Trees:</strong> #{rec_tree}</div>
               <div>🛣️ <strong>Paved Surfaces:</strong> #{rec_paved}</div>
+              <div>📍 <strong>Points CSV:</strong> <span id="rec-csv-label">#{default_csv && !default_csv.empty? ? escape_html(File.basename(default_csv)) : 'None'}</span> <button type="button" onclick="sketchup.browse_csv_points()" style="margin-left:6px; padding:1px 8px; font-size:11px; border:1px solid rgba(255,255,255,0.45); background:rgba(255,255,255,0.15); color:#fff; border-radius:4px; cursor:pointer;">Browse CSV...</button></div>
             </div>
             <button class="btn-fast" onclick="submitMapping()">⚡ One-Click Build 3D Site Pipeline</button>
           </div>
@@ -1185,6 +1346,16 @@ module QuickDraft
             </div>
           </div>
 
+          <div class="card">
+            <div class="card-title">6. External Survey Points CSV (Optional)</div>
+            <div class="card-desc">If the surveyor supplied a separate PNEZD/PENZD .csv points file, attach it here to merge ground elevations into the 3D terrain.</div>
+            <div style="display:flex; gap:6px; align-items:center;">
+              <input type="text" id="csv-points-path" value="#{escape_html(default_csv.to_s)}" placeholder="None (auto-detected if matching .csv exists)" style="flex:1; padding:5px 8px; border:1px solid #cbd5e1; border-radius:4px; font-size:11px; color:#334155;" readonly>
+              <button type="button" class="secondary" style="padding:5px 10px; font-size:11px;" onclick="sketchup.browse_csv_points()">Browse...</button>
+              <button type="button" class="secondary" style="padding:5px 10px; font-size:11px;" onclick="setCsvPath('')">Clear</button>
+            </div>
+          </div>
+
           <!-- Ignored Utilities List -->
           <div class="card" style="background: #fafafa;">
             <div class="card-title" style="color: #64748b; font-size: 11px;">
@@ -1207,6 +1378,14 @@ module QuickDraft
               return Array.from(inputs).map(i => i.value);
             }
 
+            function setCsvPath(p) {
+              document.getElementById('csv-points-path').value = p || '';
+              var lbl = document.getElementById('rec-csv-label');
+              if (lbl) {
+                lbl.textContent = p ? p.split(/[\\/]/).pop() : 'None';
+              }
+            }
+
             function submitMapping() {
               const data = {
                 contours: getChecked('box-contours'),
@@ -1215,7 +1394,8 @@ module QuickDraft
                 paved: getChecked('box-paved'),
                 building: getChecked('box-building'),
                 unit_scale_mode: document.getElementById('unit-scale-mode').value,
-                geodetic_datum_m: parseFloat(document.getElementById('geodetic-datum').value) || 0.0
+                geodetic_datum_m: parseFloat(document.getElementById('geodetic-datum').value) || 0.0,
+                csv_points_path: document.getElementById('csv-points-path').value
               };
               sketchup.process_mapping(data);
             }
@@ -1393,10 +1573,67 @@ module QuickDraft
       puts "QuickDraft: Culled #{to_erase.size} distant off-site entities. Site_Survey_2D bounding box tightly framed to drawing sheet."
     end
 
+    # Filter property edges to the main connected parcel component(s),
+    # automatically dropping stray legend/scale-bar lines far outside the site.
+    def self.filter_main_property_edges(raw_edges)
+      return raw_edges if raw_edges.size <= 1
+      adj = Array.new(raw_edges.size) { [] }
+      tol_sq = 36.0 * 36.0
+      raw_edges.each_with_index do |(a1, a2), i|
+        ((i + 1)...raw_edges.size).each do |j|
+          b1, b2 = raw_edges[j]
+          if (a1.x - b1.x)**2 + (a1.y - b1.y)**2 <= tol_sq ||
+             (a1.x - b2.x)**2 + (a1.y - b2.y)**2 <= tol_sq ||
+             (a2.x - b1.x)**2 + (a2.y - b1.y)**2 <= tol_sq ||
+             (a2.x - b2.x)**2 + (a2.y - b2.y)**2 <= tol_sq
+            adj[i] << j
+            adj[j] << i
+          end
+        end
+      end
+
+      visited = {}
+      comps = []
+      raw_edges.each_index do |i|
+        next if visited[i]
+        stack = [i]
+        visited[i] = true
+        comp = []
+        total_len = 0.0
+        while !stack.empty?
+          cur = stack.pop
+          comp << raw_edges[cur]
+          p1, p2 = raw_edges[cur]
+          total_len += Math.hypot(p2.x - p1.x, p2.y - p1.y)
+          adj[cur].each do |nxt|
+            next if visited[nxt]
+            visited[nxt] = true
+            stack << nxt
+          end
+        end
+        comps << [total_len, comp]
+      end
+
+      return raw_edges if comps.empty?
+      main_len, main_comp = comps.max_by { |len, _c| len }
+      main_pts = main_comp.flatten(1)
+      mx_min, mx_max = main_pts.map(&:x).minmax
+      my_min, my_max = main_pts.map(&:y).minmax
+      kept = []
+      comps.each do |len, comp|
+        if len >= main_len * 0.25 || comp.any? { |p1, p2|
+          [p1, p2].any? { |p| p.x >= mx_min - 120.0 && p.x <= mx_max + 120.0 && p.y >= my_min - 120.0 && p.y <= my_max + 120.0 }
+        }
+          kept.concat(comp)
+        end
+      end
+      kept.empty? ? main_comp : kept
+    end
+
     def self.get_property_bounds(survey_group, property_layers)
       return nil if property_layers.nil? || property_layers.empty?
 
-      prop_box = Geom::BoundingBox.new
+      raw_edges = []
       tr = survey_group.transformation
 
       collect_prop_pts = lambda do |entities, current_tr, parent_layer|
@@ -1404,8 +1641,7 @@ module QuickDraft
           if entity.is_a?(Sketchup::Edge)
             lname = (entity.layer && entity.layer.name != '0' && entity.layer.name.downcase != 'layer0') ? entity.layer.name : parent_layer
             if lname && property_layers.include?(lname)
-              prop_box.add(entity.start.position.transform(current_tr))
-              prop_box.add(entity.end.position.transform(current_tr))
+              raw_edges << [entity.start.position.transform(current_tr), entity.end.position.transform(current_tr)]
             end
           elsif entity.is_a?(Sketchup::Group)
             grp_layer = (entity.layer && entity.layer.name != '0' && entity.layer.name.downcase != 'layer0') ? entity.layer.name : parent_layer
@@ -1418,6 +1654,11 @@ module QuickDraft
       end
 
       collect_prop_pts.call(survey_group.entities, tr, nil)
+      prop_box = Geom::BoundingBox.new
+      filter_main_property_edges(raw_edges).each do |p1, p2|
+        prop_box.add(p1)
+        prop_box.add(p2)
+      end
       prop_box.empty? ? nil : prop_box
     end
 
@@ -1450,21 +1691,41 @@ module QuickDraft
       text_group = text_res.is_a?(Array) ? text_res[0] : nil
       text_count = text_res.is_a?(Array) ? text_res[1] : text_res.to_i
 
-      # 6. Move all floating 3D CAD ConstructionPoints onto a dedicated hidden tag for clean LayOut 2D views
+      # 6. Extract all floating 3D CAD ConstructionPoints out of Site_Survey_2D into a separate hidden group
       tag_pts = ensure_tag(model, TAG_SURVEY_POINTS, Sketchup::Color.new(150, 150, 150))
-      move_cpoints = lambda do |ents, visited_defs = {}|
-        ents.each do |ent|
+      extracted_cpoints = []
+      to_erase_cpoints = []
+      collect_cpoints = lambda do |ents, cur_tr, p_lay = nil, visited_defs = {}|
+        ents.to_a.each do |ent|
+          next unless ent.valid?
+          el = (ent.respond_to?(:layer) && ent.layer && ent.layer.name != '0' && ent.layer.name.downcase != 'layer0') ? ent.layer : p_lay
           if ent.is_a?(Sketchup::ConstructionPoint)
-            ent.layer = tag_pts
+            extracted_cpoints << [ent.position.transform(cur_tr), el]
+            to_erase_cpoints << [ents, ent]
           elsif ent.is_a?(Sketchup::Group)
-            move_cpoints.call(ent.entities, visited_defs)
-          elsif ent.is_a?(Sketchup::ComponentInstance) && ent.definition && !visited_defs[ent.definition.object_id]
+            collect_cpoints.call(ent.entities, cur_tr * ent.transformation, el, visited_defs)
+          elsif ent.is_a?(Sketchup::ComponentInstance) && ent.definition
+            next if visited_defs[ent.definition.object_id]
             visited_defs[ent.definition.object_id] = true
-            move_cpoints.call(ent.definition.entities, visited_defs)
+            collect_cpoints.call(ent.definition.entities, cur_tr * ent.transformation, el, visited_defs)
           end
         end
       end
-      move_cpoints.call(survey_group.entities)
+      collect_cpoints.call(survey_group.entities, survey_group.transformation)
+      unless extracted_cpoints.empty?
+        pts_group = model.entities.grep(Sketchup::Group).find { |g| g.valid? && g.name == 'Site_Survey_Points' }
+        unless pts_group
+          pts_group = model.entities.add_group
+          pts_group.name = 'Site_Survey_Points'
+        end
+        pts_group.layer = tag_pts
+        inv_pts_tr = pts_group.transformation.inverse
+        extracted_cpoints.each do |world_pt, orig_layer|
+          cp = pts_group.entities.add_cpoint(world_pt.transform(inv_pts_tr))
+          cp.layer = orig_layer || tag_pts
+        end
+        to_erase_cpoints.each { |ents, ent| ents.erase_entities(ent) if ent.valid? }
+      end
       tag_pts.visible = false if tag_pts.respond_to?(:visible=)
 
       {
@@ -1543,6 +1804,8 @@ module QuickDraft
       end
 
       collect_elevation_points.call(survey_group.entities, tr)
+      pts_group = model.entities.grep(Sketchup::Group).find { |g| g.valid? && g.name == 'Site_Survey_Points' }
+      collect_elevation_points.call(pts_group.entities, pts_group.transformation) if pts_group
 
       # Filter elevation points to a 25 ft (300") perimeter buffer around property boundaries.
       # Captures all perimeter points, road frontage, trees, and top-of-bank,
@@ -1566,7 +1829,7 @@ module QuickDraft
 
       # Extend terrain mesh straight along the West & East side lot lines to meet the front road line
       if prop_box && !prop_box.empty? && elevation_points.size >= 3
-        all_prop_segs = []
+        raw_prop_edges = []
         collect_prop_segs = lambda do |ents, cur_tr, p_lay = nil|
           ents.each do |ent|
             if ent.is_a?(Sketchup::Edge)
@@ -1574,7 +1837,7 @@ module QuickDraft
               if el && property_layers && property_layers.include?(el)
                 q1 = ent.start.position.transform(cur_tr)
                 q2 = ent.end.position.transform(cur_tr)
-                all_prop_segs << [q1, q2] if q1.distance(q2) > 300.0
+                raw_prop_edges << [q1, q2]
               end
             elsif ent.is_a?(Sketchup::Group)
               gl = (ent.layer && ent.layer.name != '0' && ent.layer.name.downcase != 'layer0') ? ent.layer.name : p_lay
@@ -1586,6 +1849,10 @@ module QuickDraft
           end
         end
         collect_prop_segs.call(survey_group.entities, tr)
+
+        main_prop_edges = filter_main_property_edges(raw_prop_edges)
+        all_prop_verts = main_prop_edges.flatten(1)
+        all_prop_segs = main_prop_edges.select { |q1, q2| q1.distance(q2) > 300.0 }
 
         front_segs = all_prop_segs.select { |q1, q2| (q2.x - q1.x).abs > 300.0 }
         front_line = front_segs.min_by { |q1, q2| (q1.y + q2.y) * 0.5 }
@@ -1617,9 +1884,10 @@ module QuickDraft
           end
           p_top = Geom::Point3d.new(x_top_lot + 150.0, y_top, 0.0)
 
-          # Find Eastmost front-east driveway point (e.g. DWAY_LINE) if present, else default +600"
+          # Find Eastmost front-east driveway point (e.g. DWAY_LINE) and front asphalt road edges if present
           dway_east_pt = nil
-          collect_dway_east = lambda do |ents, cur_tr, p_lay = nil|
+          has_front_asph = false
+          collect_front_paved = lambda do |ents, cur_tr, p_lay = nil|
             ents.each do |ent|
               if ent.is_a?(Sketchup::Edge)
                 el = (ent.layer && ent.layer.name != '0' && ent.layer.name.downcase != 'layer0') ? ent.layer.name : p_lay
@@ -1630,66 +1898,104 @@ module QuickDraft
                       dway_east_pt = wp if dway_east_pt.nil? || wp.x > dway_east_pt.x
                     end
                   end
+                elsif el && el.downcase =~ /asph|road/
+                  mp = ent.start.position.transform(cur_tr)
+                  has_front_asph = true if mp.y <= fp2.y + 200.0 && mp.y >= fp1.y - 600.0
                 end
               elsif ent.is_a?(Sketchup::Group)
                 gl = (ent.layer && ent.layer.name != '0' && ent.layer.name.downcase != 'layer0') ? ent.layer.name : p_lay
-                collect_dway_east.call(ent.entities, cur_tr * ent.transformation, gl)
+                collect_front_paved.call(ent.entities, cur_tr * ent.transformation, gl)
               elsif ent.is_a?(Sketchup::ComponentInstance)
                 il = (ent.layer && ent.layer.name != '0' && ent.layer.name.downcase != 'layer0') ? ent.layer.name : p_lay
-                collect_dway_east.call(ent.definition.entities, cur_tr * ent.transformation, il)
+                collect_front_paved.call(ent.definition.entities, cur_tr * ent.transformation, il)
               end
             end
           end
-          collect_dway_east.call(survey_group.entities, tr)
+          collect_front_paved.call(survey_group.entities, tr)
 
-          p_mid = if dway_east_pt
-            Geom::Point3d.new(dway_east_pt.x + 75.0, dway_east_pt.y, 0.0)
-          else
-            Geom::Point3d.new(fp2.x + 600.0, fp2.y - 65.0, 0.0)
-          end
+          if dway_east_pt || has_front_asph
+            p_mid = if dway_east_pt
+              Geom::Point3d.new(dway_east_pt.x + 75.0, dway_east_pt.y, 0.0)
+            else
+              Geom::Point3d.new(fp2.x + 150.0, fp2.y - 65.0, 0.0)
+            end
 
-          # Intersect East angled line (p_top -> p_mid) with front road line (s_pt + t * u)
-          ex_dir = p_mid.x - p_top.x
-          ey_dir = p_mid.y - p_top.y
-          det = ex_dir * (-uy) - ey_dir * (-ux)
-          if det.abs > 1e-6
-            rhs_x = s_pt.x - p_top.x
-            rhs_y = s_pt.y - p_top.y
-            s_param = (rhs_x * (-uy) - rhs_y * (-ux)) / det
-            e_pt = Geom::Point3d.new(p_top.x + s_param * ex_dir, p_top.y + s_param * ey_dir, 0.0)
-          else
-            e_pt = Geom::Point3d.new(fp2.x + ux * 650.0 + nx * road_depth, fp2.y + uy * 650.0 + ny * road_depth, 0.0)
-          end
+            # Intersect East angled line (p_top -> p_mid) with front road line (s_pt + t * u)
+            ex_dir = p_mid.x - p_top.x
+            ey_dir = p_mid.y - p_top.y
+            det = ex_dir * (-uy) - ey_dir * (-ux)
+            if det.abs > 1e-6
+              rhs_x = s_pt.x - p_top.x
+              rhs_y = s_pt.y - p_top.y
+              s_param = (rhs_x * (-uy) - rhs_y * (-ux)) / det
+              e_pt = Geom::Point3d.new(p_top.x + s_param * ex_dir, p_top.y + s_param * ey_dir, 0.0)
+            else
+              e_pt = Geom::Point3d.new(fp2.x + ux * 150.0 + nx * road_depth, fp2.y + uy * 150.0 + ny * road_depth, 0.0)
+            end
 
-          # Clip any existing elevation points below y_top that lie East of the straight angled East line
-          if e_pt.y < p_top.y - 1.0
-            elevation_points.reject! do |pt|
-              if pt.y <= p_top.y
-                t_clip = (pt.y - p_top.y) / (e_pt.y - p_top.y)
-                max_x_line = p_top.x + t_clip * (e_pt.x - p_top.x)
-                pt.x > max_x_line + 1.0
-              else
-                false
+            # Clip any existing elevation points below y_top that lie East of the straight angled East line
+            if e_pt.y < p_top.y - 1.0
+              elevation_points.reject! do |pt|
+                if pt.y <= p_top.y
+                  t_clip = (pt.y - p_top.y) / (e_pt.y - p_top.y)
+                  max_x_line = p_top.x + t_clip * (e_pt.x - p_top.x)
+                  pt.x > max_x_line + 1.0
+                else
+                  false
+                end
               end
             end
-          end
 
-          (0..7).each do |i|
-            t = i / 7.0
-            ex = s_pt.x + (e_pt.x - s_pt.x) * t
-            ey = s_pt.y + (e_pt.y - s_pt.y) * t
-            nearest = elevation_points.min_by { |pt| (pt.x - ex)**2 + (pt.y - ey)**2 }
-            elevation_points << Geom::Point3d.new(ex, ey, nearest.z) if nearest
-          end
+            (0..7).each do |i|
+              t = i / 7.0
+              ex = s_pt.x + (e_pt.x - s_pt.x) * t
+              ey = s_pt.y + (e_pt.y - s_pt.y) * t
+              nearest = elevation_points.min_by { |pt| (pt.x - ex)**2 + (pt.y - ey)**2 }
+              elevation_points << Geom::Point3d.new(ex, ey, nearest.z) if nearest
+            end
 
-          # Anchor West front-lot corner and East angled-line points
-          [
-            [fp1.x - ux * 250.0, fp1.y - uy * 250.0],
-            [p_top.x, p_top.y],
-            [p_mid.x, p_mid.y]
-          ].each do |ax, ay|
-            nearest_a = elevation_points.min_by { |pt| (pt.x - ax)**2 + (pt.y - ay)**2 }
-            elevation_points << Geom::Point3d.new(ax, ay, nearest_a.z) if nearest_a
+            # Anchor West front-lot corner and East angled-line points
+            [
+              [fp1.x - ux * 250.0, fp1.y - uy * 250.0],
+              [p_top.x, p_top.y],
+              [p_mid.x, p_mid.y]
+            ].each do |ax, ay|
+              nearest_a = elevation_points.min_by { |pt| (pt.x - ax)**2 + (pt.y - ay)**2 }
+              elevation_points << Geom::Point3d.new(ax, ay, nearest_a.z) if nearest_a
+            end
+          else
+            # General lots without front asphalt/neighboring driveway:
+            # 1. Tighten perimeter filter to +/- 180" (15 ft) around prop_box so off-lot text boxes/tables cannot spike the mesh.
+            elevation_points.select! do |pt|
+              pt.x >= prop_box.min.x - 180.0 && pt.x <= prop_box.max.x + 180.0 &&
+              pt.y >= prop_box.min.y - 180.0 && pt.y <= prop_box.max.y + 180.0
+            end
+
+            # 2. Offset all property/shoreline vertices outward by 180" (15 ft) so terrain covers the full lot + uniform border
+            unless all_prop_verts.empty? || elevation_points.empty?
+              seen_prop_keys = {}
+              uniq_prop = []
+              all_prop_verts.each do |pv|
+                pkey = [(pv.x / 12.0).round, (pv.y / 12.0).round]
+                next if seen_prop_keys[pkey]
+                seen_prop_keys[pkey] = true
+                uniq_prop << pv
+              end
+
+              lot_cx = uniq_prop.map(&:x).sum / uniq_prop.size.to_f
+              lot_cy = uniq_prop.map(&:y).sum / uniq_prop.size.to_f
+              offset_in = 180.0
+
+              uniq_prop.each do |pv|
+                dx_o = pv.x - lot_cx
+                dy_o = pv.y - lot_cy
+                d_o = Math.hypot(dx_o, dy_o)
+                ox = (d_o > 1e-3) ? (pv.x + (dx_o / d_o) * offset_in) : pv.x
+                oy = (d_o > 1e-3) ? (pv.y + (dy_o / d_o) * offset_in) : pv.y
+                nearest_p = elevation_points.min_by { |pt| (pt.x - ox)**2 + (pt.y - oy)**2 }
+                elevation_points << Geom::Point3d.new(ox, oy, nearest_p.z) if nearest_p
+              end
+            end
           end
         end
       end
@@ -1817,7 +2123,7 @@ module QuickDraft
         building_layers = []
         survey_group.entities.each do |e|
           l = e.layer ? e.layer.name : nil
-          if l && l.downcase =~ /^(b_lines|deck_lines|stairs_line|dwelling|building)/i && l.downcase !~ /(symb|sym|point|pt|elev|num|des|text|tank)/i
+          if l && l.downcase =~ /(^|_|\.)(b_lines|deck_lines|stairs_line|dwelling|building)/i && l.downcase !~ /(symb|sym|point|pt|elev|num|des|text|tank)/i
             building_layers << l unless building_layers.include?(l)
           end
         end
@@ -1827,7 +2133,21 @@ module QuickDraft
       paved_by_layer = collect_lines_by_layer.call(survey_group.entities, tr, paved_target, nil)
       bldg_by_layer = collect_lines_by_layer.call(survey_group.entities, tr, building_layers, nil)
 
-      prop_edges = prop_by_layer.values.flatten(1)
+      prop_edges = filter_main_property_edges(prop_by_layer.values.flatten(1))
+
+      # Also include adjacent-lot / shoreline continuation edges (e.g. LGL_LOT_SCENERY) that fall within terrain bounds
+      scenery_layers = model.layers.map(&:name).select { |ln| ln =~ /scenery|adj_lot|nbound|shore/i && !(property_layers || []).include?(ln) }
+      unless scenery_layers.empty?
+        scenery_by_layer = collect_lines_by_layer.call(survey_group.entities, tr, scenery_layers, nil)
+        tb = terrain_group ? terrain_group.bounds : nil
+        scenery_by_layer.values.flatten(1).each do |p1, p2|
+          mx = (p1.x + p2.x) * 0.5
+          my = (p1.y + p2.y) * 0.5
+          if tb.nil? || (mx >= tb.min.x - 50.0 && mx <= tb.max.x + 50.0 && my >= tb.min.y - 50.0 && my <= tb.max.y + 50.0)
+            prop_edges << [p1, p2]
+          end
+        end
+      end
       paved_edges = paved_by_layer.values.flatten(1)
       return nil if prop_edges.empty? && paved_edges.empty? && bldg_by_layer.values.flatten(1).empty?
 
@@ -2969,6 +3289,8 @@ module QuickDraft
       end
 
       collect_trees.call(survey_group.entities, tr)
+      pts_group = model.entities.grep(Sketchup::Group).find { |g| g.valid? && g.name == 'Site_Survey_Points' }
+      collect_trees.call(pts_group.entities, pts_group.transformation) if pts_group
       return if tree_records.empty?
 
       # Filter trees within property boundary buffer, and strictly exclude sample tree in sheet legend
